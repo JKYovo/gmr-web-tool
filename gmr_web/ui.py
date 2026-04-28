@@ -1,3 +1,5 @@
+import html
+import json
 import re
 from pathlib import Path
 from datetime import datetime, timezone
@@ -20,6 +22,47 @@ SELECTABLE_OUTPUT_CSS = """
 textarea, input, pre, code, .cm-content, .cm-line {
   user-select: text !important;
   -webkit-user-select: text !important;
+}
+.gmr-history-card {
+  border: 1px solid #e5e7eb;
+  border-radius: 14px;
+  padding: 14px 16px;
+  background: linear-gradient(180deg, #ffffff 0%, #f8fafc 100%);
+  box-shadow: 0 8px 22px rgba(15, 23, 42, 0.06);
+}
+.gmr-history-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 10px;
+}
+.gmr-history-item {
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.78);
+  padding: 10px 12px;
+  border: 1px solid rgba(148, 163, 184, 0.22);
+}
+.gmr-history-label {
+  color: #64748b;
+  font-size: 12px;
+  margin-bottom: 4px;
+}
+.gmr-history-value {
+  color: #0f172a;
+  font-size: 14px;
+  font-weight: 650;
+  word-break: break-word;
+}
+.gmr-quality-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: 10px;
+}
+.gmr-empty-note {
+  color: #64748b;
+  border: 1px dashed #cbd5e1;
+  border-radius: 12px;
+  padding: 12px 14px;
+  background: #f8fafc;
 }
 """
 
@@ -127,6 +170,17 @@ def _path_name(value):
     return Path(str(value)).name
 
 
+def _safe_html(value):
+    return html.escape(str(value if value is not None else "-"))
+
+
+def _existing_path(value):
+    if not value:
+        return None
+    path = Path(str(value))
+    return str(path) if path.exists() else None
+
+
 def _display_file_name(job):
     for key in ("display_name", "source_input_file", "input_file"):
         name = _path_name(job.get(key))
@@ -182,20 +236,125 @@ def _format_job_detail(job):
     return "\n".join(lines)
 
 
+def _format_history_summary(job):
+    if not job:
+        return "<div class='gmr-empty-note'>请选择一个任务查看详情。</div>"
+    source_name = _display_file_name(job)
+    output_dir = job.get("output_dir") or "-"
+    fields = [
+        ("文件名", source_name),
+        ("Source", job.get("source_type", "-")),
+        ("任务状态", job.get("status", "-")),
+        ("后处理", job.get("postprocess_status") or "尚未生成"),
+        ("提交时间", _display_time(job.get("submitted_at"))),
+        ("输出目录", output_dir),
+    ]
+    items = "\n".join(
+        "<div class='gmr-history-item'>"
+        f"<div class='gmr-history-label'>{_safe_html(label)}</div>"
+        f"<div class='gmr-history-value'>{_safe_html(value)}</div>"
+        "</div>"
+        for label, value in fields
+    )
+    return f"<div class='gmr-history-card'><div class='gmr-history-grid'>{items}</div></div>"
+
+
+def _nested_value(data, *keys):
+    current = data
+    for key in keys:
+        if not isinstance(current, dict):
+            return None
+        current = current.get(key)
+    return current
+
+
+def _fmt_metric(value, suffix=""):
+    if value is None:
+        return "-"
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    if abs(number) >= 100:
+        text = f"{number:.1f}"
+    elif abs(number) >= 10:
+        text = f"{number:.2f}"
+    else:
+        text = f"{number:.4f}"
+    return f"{text}{suffix}"
+
+
+def _format_quality_summary(quality_path):
+    path = _existing_path(quality_path)
+    if not path:
+        return "<div class='gmr-empty-note'>暂无优化质量报告。生成优化版后这里会显示 spike、加速度、jerk 和脚滑摘要。</div>"
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except Exception as exc:
+        return f"<div class='gmr-empty-note'>质量报告读取失败：{_safe_html(exc)}</div>"
+
+    after = data.get("after") if isinstance(data.get("after"), dict) else data
+    contact = after.get("contact", {}) if isinstance(after, dict) else {}
+    foot_lock = data.get("foot_lock", {}) if isinstance(data.get("foot_lock"), dict) else {}
+    repair = data.get("repair", {}) if isinstance(data.get("repair"), dict) else {}
+    fields = [
+        ("优化器", data.get("optimizer_version", "-")),
+        ("Pipeline", data.get("pipeline", "-")),
+        ("Spike 数", after.get("spike_count_total", "-") if isinstance(after, dict) else "-"),
+        ("加速度 max", _fmt_metric(_nested_value(after, "dof_acceleration", "max"), " rad/s^2")),
+        ("Jerk max", _fmt_metric(_nested_value(after, "dof_jerk", "max"), " rad/s^3")),
+        ("脚滑 p95", _fmt_metric(_nested_value(contact, "estimated_foot_sliding_speed", "p95"), " m/s")),
+        ("脚穿地估计", _fmt_metric(contact.get("estimated_ground_penetration_depth"), " m")),
+        ("Foot-lock 帧数", foot_lock.get("corrected_frames", "-")),
+        ("修复异常帧", repair.get("spike_frame_count", "-")),
+    ]
+    items = "\n".join(
+        "<div class='gmr-history-item'>"
+        f"<div class='gmr-history-label'>{_safe_html(label)}</div>"
+        f"<div class='gmr-history-value'>{_safe_html(value)}</div>"
+        "</div>"
+        for label, value in fields
+    )
+    return f"<div class='gmr-history-card'><div class='gmr-quality-list'>{items}</div></div>"
+
+
 def _job_output_tuple(job, status_message=None, postprocess_message=None):
     motion, video, zip_file = _files(job)
     optimized_motion, optimized_video, quality_report = _postprocess_files(job)
     return (
+        _format_history_summary(job),
         status_message or _status_text(job),
         postprocess_message or _postprocess_status_text(job),
+        _format_quality_summary(quality_report),
         _format_job_detail(job),
         _logs(job),
-        motion,
-        video,
-        optimized_motion,
-        optimized_video,
-        quality_report,
-        zip_file,
+        _existing_path(video),
+        _existing_path(optimized_video),
+        _existing_path(motion),
+        _existing_path(video),
+        _existing_path(optimized_motion),
+        _existing_path(optimized_video),
+        _existing_path(quality_report),
+        _existing_path(zip_file),
+    )
+
+
+def _empty_history_tuple(message):
+    return (
+        "<div class='gmr-empty-note'>请选择一个任务查看详情。</div>",
+        message,
+        "",
+        "<div class='gmr-empty-note'>暂无优化质量报告。</div>",
+        "",
+        "",
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
     )
 
 
@@ -297,6 +456,7 @@ def build_ui(manager, gvhmr_manager=None):
                 artifact_file = gr.File(label="artifacts.zip")
 
         with gr.Tab("任务历史"):
+            gr.Markdown("## 任务历史")
             refresh = gr.Button("刷新历史")
             with gr.Row():
                 status_filter = gr.Dropdown(
@@ -314,11 +474,17 @@ def build_ui(manager, gvhmr_manager=None):
                 interactive=False,
             )
             selected_job = gr.Textbox(label="输入任务 ID 查看详情")
-            load_job = gr.Button("查看任务")
-            retry_job = gr.Button("重试任务")
-            cancel_job = gr.Button("取消任务")
+            with gr.Row():
+                load_job = gr.Button("查看任务", variant="primary")
+                retry_job = gr.Button("重试任务")
+                cancel_job = gr.Button("取消任务")
+                postprocess_job = gr.Button("生成优化版", variant="primary")
+
+            gr.Markdown("### 任务摘要")
+            history_summary = gr.HTML("<div class='gmr-empty-note'>请选择一个任务查看详情。</div>")
             history_status = gr.Textbox(label="历史状态", interactive=True, show_copy_button=True)
             history_postprocess_status = gr.Textbox(label="后处理状态", interactive=True, show_copy_button=True)
+
             with gr.Accordion("高级后处理参数", open=False):
                 postprocess_profile = gr.Dropdown(
                     ["soft", "preview", "strict"],
@@ -331,20 +497,26 @@ def build_ui(manager, gvhmr_manager=None):
                     label="优化流程 pipeline",
                 )
                 postprocess_render = gr.Checkbox(value=True, label="生成优化版预览视频")
-            postprocess_job = gr.Button("生成优化版", variant="primary")
-            job_detail = gr.Code(label="任务详情", language="shell", lines=10)
-            history_logs = gr.Code(label="任务日志", language="shell", lines=10)
-            gr.Markdown("### 原始结果")
+
+            gr.Markdown("### 视频对比")
             with gr.Row():
-                history_motion = gr.File(label="robot_motion.pkl")
-                history_video = gr.Video(label="robot_preview.mp4")
-            gr.Markdown("### 优化结果")
+                history_video = gr.Video(label="原始预览 robot_preview.mp4", height=360, show_download_button=True)
+                history_optimized_video = gr.Video(label="优化预览 preview_foot.mp4", height=360, show_download_button=True)
+
+            gr.Markdown("### 下载与质量摘要")
             with gr.Row():
-                history_optimized_motion = gr.File(label="优化版 motion pkl")
-                history_optimized_video = gr.Video(label="优化版 preview mp4")
-                history_quality = gr.File(label="质量报告 json")
+                history_motion_download = gr.DownloadButton("下载 robot_motion.pkl")
+                history_video_download = gr.DownloadButton("下载 robot_preview.mp4")
+                history_optimized_motion_download = gr.DownloadButton("下载 motion_foot.pkl")
             with gr.Row():
-                history_zip = gr.File(label="artifacts.zip")
+                history_optimized_video_download = gr.DownloadButton("下载 preview_foot.mp4")
+                history_quality_download = gr.DownloadButton("下载 quality_foot.json")
+                history_zip_download = gr.DownloadButton("下载 artifacts.zip", variant="primary")
+            history_quality_summary = gr.HTML("<div class='gmr-empty-note'>暂无优化质量报告。</div>")
+
+            with gr.Accordion("高级信息：日志与任务详情", open=False):
+                history_logs = gr.Code(label="任务日志", language="shell", lines=10)
+                job_detail = gr.Code(label="任务详情", language="shell", lines=10)
 
         with gr.Tab("配置说明"):
             gr.Markdown("## ELF3 输入配置")
@@ -476,16 +648,16 @@ def build_ui(manager, gvhmr_manager=None):
         def inspect_job(job_id):
             job_id = (job_id or "").strip()
             if not job_id:
-                return ("请输入任务 ID。", "", "", "", None, None, None, None, None, None)
+                return _empty_history_tuple("请输入任务 ID。")
             job = manager.get_job(job_id)
             if job is None:
-                return (f"任务不存在：{job_id}", "", "", "", None, None, None, None, None, None)
+                return _empty_history_tuple(f"任务不存在：{job_id}")
             return _job_output_tuple(job)
 
         def request_postprocess_selected(job_id, profile, pipeline, render):
             job_id = (job_id or "").strip()
             if not job_id:
-                yield ("请输入任务 ID。", "", "", "", None, None, None, None, None, None)
+                yield _empty_history_tuple("请输入任务 ID。")
                 return
             try:
                 job = manager.request_postprocess(
@@ -497,12 +669,12 @@ def build_ui(manager, gvhmr_manager=None):
             except Exception as exc:
                 existing = manager.get_job(job_id)
                 if existing is None:
-                    yield (f"后处理提交失败：{exc}", "", "", "", None, None, None, None, None, None)
+                    yield _empty_history_tuple(f"后处理提交失败：{exc}")
                 else:
                     yield _job_output_tuple(existing, postprocess_message=f"后处理提交失败：{exc}")
                 return
             if job is None:
-                yield (f"任务不存在：{job_id}", "", "", "", None, None, None, None, None, None)
+                yield _empty_history_tuple(f"任务不存在：{job_id}")
                 return
 
             while True:
@@ -517,22 +689,22 @@ def build_ui(manager, gvhmr_manager=None):
         def retry_selected(job_id):
             job_id = (job_id or "").strip()
             if not job_id:
-                return ("请输入任务 ID。", "", "", "", None, None, None, None, None, None)
+                return _empty_history_tuple("请输入任务 ID。")
             try:
                 job = manager.retry_job(job_id)
             except Exception as exc:
-                return (f"重试失败：{exc}", "", "", "", None, None, None, None, None, None)
+                return _empty_history_tuple(f"重试失败：{exc}")
             if job is None:
-                return (f"任务不存在：{job_id}", "", "", "", None, None, None, None, None, None)
+                return _empty_history_tuple(f"任务不存在：{job_id}")
             return inspect_job(job_id)
 
         def cancel_selected(job_id):
             job_id = (job_id or "").strip()
             if not job_id:
-                return ("请输入任务 ID。", "", "", "", None, None, None, None, None, None)
+                return _empty_history_tuple("请输入任务 ID。")
             job = manager.cancel_job(job_id)
             if job is None:
-                return (f"任务不存在：{job_id}", "", "", "", None, None, None, None, None, None)
+                return _empty_history_tuple(f"任务不存在：{job_id}")
             return inspect_job(job_id)
 
         submit.click(
@@ -561,64 +733,80 @@ def build_ui(manager, gvhmr_manager=None):
             inspect_job,
             inputs=[selected_job],
             outputs=[
+                history_summary,
                 history_status,
                 history_postprocess_status,
+                history_quality_summary,
                 job_detail,
                 history_logs,
-                history_motion,
                 history_video,
-                history_optimized_motion,
                 history_optimized_video,
-                history_quality,
-                history_zip,
+                history_motion_download,
+                history_video_download,
+                history_optimized_motion_download,
+                history_optimized_video_download,
+                history_quality_download,
+                history_zip_download,
             ],
         )
         postprocess_job.click(
             request_postprocess_selected,
             inputs=[selected_job, postprocess_profile, postprocess_pipeline, postprocess_render],
             outputs=[
+                history_summary,
                 history_status,
                 history_postprocess_status,
+                history_quality_summary,
                 job_detail,
                 history_logs,
-                history_motion,
                 history_video,
-                history_optimized_motion,
                 history_optimized_video,
-                history_quality,
-                history_zip,
+                history_motion_download,
+                history_video_download,
+                history_optimized_motion_download,
+                history_optimized_video_download,
+                history_quality_download,
+                history_zip_download,
             ],
         )
         retry_job.click(
             retry_selected,
             inputs=[selected_job],
             outputs=[
+                history_summary,
                 history_status,
                 history_postprocess_status,
+                history_quality_summary,
                 job_detail,
                 history_logs,
-                history_motion,
                 history_video,
-                history_optimized_motion,
                 history_optimized_video,
-                history_quality,
-                history_zip,
+                history_motion_download,
+                history_video_download,
+                history_optimized_motion_download,
+                history_optimized_video_download,
+                history_quality_download,
+                history_zip_download,
             ],
         )
         cancel_job.click(
             cancel_selected,
             inputs=[selected_job],
             outputs=[
+                history_summary,
                 history_status,
                 history_postprocess_status,
+                history_quality_summary,
                 job_detail,
                 history_logs,
-                history_motion,
                 history_video,
-                history_optimized_motion,
                 history_optimized_video,
-                history_quality,
-                history_zip,
+                history_motion_download,
+                history_video_download,
+                history_optimized_motion_download,
+                history_optimized_video_download,
+                history_quality_download,
+                history_zip_download,
             ],
         )
 
