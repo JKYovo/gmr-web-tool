@@ -64,6 +64,102 @@ textarea, input, pre, code, .cm-content, .cm-line {
   padding: 12px 14px;
   background: #f8fafc;
 }
+.gmr-hero {
+  border: 1px solid #dbeafe;
+  border-radius: 20px;
+  padding: 20px 22px;
+  background:
+    radial-gradient(circle at 10% 10%, rgba(14, 165, 233, 0.16), transparent 30%),
+    linear-gradient(135deg, #f8fafc 0%, #eef6ff 100%);
+  box-shadow: 0 14px 34px rgba(15, 23, 42, 0.08);
+  margin-bottom: 14px;
+}
+.gmr-hero h1 {
+  margin: 0 0 6px;
+  font-size: 30px;
+  letter-spacing: -0.03em;
+}
+.gmr-section-title {
+  margin: 18px 0 8px;
+  color: #0f172a;
+  font-size: 18px;
+  font-weight: 750;
+}
+.gmr-download-row {
+  align-items: center;
+}
+.gmr-video-compare video,
+.gmr-preview-video video {
+  border-radius: 14px;
+  background: #0f172a;
+}
+.gmr-sync-controls {
+  border: 1px solid #e2e8f0;
+  border-radius: 14px;
+  padding: 10px;
+  background: #f8fafc;
+  margin-bottom: 8px;
+}
+"""
+
+SYNC_PLAY_JS = """
+() => {
+  const root = document.querySelector('.gmr-video-compare');
+  const videos = root ? Array.from(root.querySelectorAll('video')) : [];
+  if (videos.length < 2) return [];
+  const playable = videos.filter((video) => Number.isFinite(video.duration) && video.duration > 0);
+  if (!playable.length) return [];
+  const baseTime = playable[0].currentTime || 0;
+  const shouldPlay = playable.some((video) => video.paused);
+  playable.forEach((video) => {
+    if (Math.abs(video.currentTime - baseTime) > 0.20) video.currentTime = baseTime;
+    if (shouldPlay) {
+      video.play().catch(() => {});
+    } else {
+      video.pause();
+    }
+  });
+  return [];
+}
+"""
+
+SYNC_SEEK_JS = """
+() => {
+  const root = document.querySelector('.gmr-video-compare');
+  const videos = root ? Array.from(root.querySelectorAll('video')) : [];
+  if (videos.length < 2) return [];
+  const playable = videos.filter((video) => Number.isFinite(video.duration) && video.duration > 0);
+  if (!playable.length) return [];
+  const baseTime = playable[0].currentTime || 0;
+  playable.slice(1).forEach((video) => {
+    video.currentTime = Math.min(baseTime, video.duration || baseTime);
+  });
+  return [];
+}
+"""
+
+RESET_VIDEOS_JS = """
+() => {
+  const root = document.querySelector('.gmr-video-compare');
+  const videos = root ? Array.from(root.querySelectorAll('video')) : [];
+  videos.forEach((video) => {
+    video.pause();
+    video.currentTime = 0;
+  });
+  return [];
+}
+"""
+
+SET_SPEED_JS = """
+(rate) => {
+  const root = document.querySelector('.gmr-video-compare');
+  const videos = root ? Array.from(root.querySelectorAll('video')) : [];
+  const speed = Number.parseFloat(rate || 1) || 1;
+  videos.forEach((video) => {
+    video.playbackRate = speed;
+  });
+  return [];
+}
 """
 
 
@@ -259,6 +355,57 @@ def _format_history_summary(job):
     return f"<div class='gmr-history-card'><div class='gmr-history-grid'>{items}</div></div>"
 
 
+def _format_result_summary(job):
+    if not job:
+        return "<div class='gmr-empty-note'>提交任务后这里会显示结果摘要。</div>"
+    motion, video, zip_file = _files(job)
+    fields = [
+        ("任务 ID", job.get("job_id", "-")),
+        ("文件名", _display_file_name(job)),
+        ("状态", job.get("status", "-")),
+        ("Source", job.get("source_type", "-")),
+        ("输出目录", job.get("output_dir", "-")),
+        ("结果", " / ".join(name for name in [_path_name(motion), _path_name(video), _path_name(zip_file)] if name) or "-"),
+    ]
+    items = "\n".join(
+        "<div class='gmr-history-item'>"
+        f"<div class='gmr-history-label'>{_safe_html(label)}</div>"
+        f"<div class='gmr-history-value'>{_safe_html(value)}</div>"
+        "</div>"
+        for label, value in fields
+    )
+    return f"<div class='gmr-history-card'><div class='gmr-history-grid'>{items}</div></div>"
+
+
+def _run_output_tuple(job):
+    motion, video, zip_file = _files(job)
+    return (
+        _status_text(job),
+        job["job_id"],
+        job["output_dir"],
+        _format_result_summary(job),
+        _logs(job),
+        _existing_path(video),
+        _existing_path(motion),
+        _existing_path(video),
+        _existing_path(zip_file),
+    )
+
+
+def _empty_run_tuple(message):
+    return (
+        message,
+        "",
+        "",
+        "<div class='gmr-empty-note'>暂无任务结果。</div>",
+        "",
+        None,
+        None,
+        None,
+        None,
+    )
+
+
 def _nested_value(data, *keys):
     current = data
     for key in keys:
@@ -411,8 +558,14 @@ def build_ui(manager, gvhmr_manager=None):
     gvhmr_initial = gvhmr_choices[0][1] if gvhmr_choices else None
 
     with gr.Blocks(title="GMR Web", css=SELECTABLE_OUTPUT_CSS) as app:
-        gr.Markdown("# GMR Web")
-        gr.Markdown("内部 ELF3 机器人动作转换工具：上传人体动作文件，后台生成机器人 `pkl` 和可选预览视频。")
+        gr.HTML(
+            """
+            <section class="gmr-hero">
+              <h1>GMR Web</h1>
+              <p>内部 ELF3 机器人动作转换工具：上传人体动作文件，后台生成机器人 pkl、预览视频和可选优化版。</p>
+            </section>
+            """
+        )
 
         if gvhmr_manager is not None:
             with gr.Tab("从 GVHMR 结果转换"):
@@ -429,11 +582,19 @@ def build_ui(manager, gvhmr_manager=None):
                 gvhmr_status = gr.Textbox(label="任务状态", interactive=True, show_copy_button=True)
                 gvhmr_gmr_job_id = gr.Textbox(label="GMR 任务 ID", interactive=True, show_copy_button=True)
                 gvhmr_output_dir = gr.Textbox(label="GMR 输出目录", interactive=True, show_copy_button=True)
-                gvhmr_logs = gr.Code(label="GMR 任务日志", language="shell", lines=10)
-                with gr.Row():
-                    gvhmr_motion_file = gr.File(label="robot_motion.pkl")
-                    gvhmr_video_file = gr.Video(label="robot_preview.mp4")
-                    gvhmr_artifact_file = gr.File(label="artifacts.zip")
+                gvhmr_result_summary = gr.HTML("<div class='gmr-empty-note'>提交任务后这里会显示结果摘要。</div>")
+                gvhmr_video_file = gr.Video(
+                    label="robot_preview.mp4",
+                    height=360,
+                    show_download_button=True,
+                    elem_classes=["gmr-preview-video"],
+                )
+                with gr.Row(elem_classes=["gmr-download-row"]):
+                    gvhmr_motion_download = gr.DownloadButton("下载 robot_motion.pkl")
+                    gvhmr_video_download = gr.DownloadButton("下载 robot_preview.mp4")
+                    gvhmr_artifact_download = gr.DownloadButton("下载 artifacts.zip", variant="primary")
+                with gr.Accordion("任务日志", open=False):
+                    gvhmr_logs = gr.Code(label="GMR 任务日志", language="shell", lines=10)
 
         with gr.Tab("单文件转换"):
             with gr.Row():
@@ -449,41 +610,35 @@ def build_ui(manager, gvhmr_manager=None):
             status = gr.Textbox(label="任务状态", interactive=True, show_copy_button=True)
             job_id = gr.Textbox(label="任务 ID", interactive=True, show_copy_button=True)
             output_dir = gr.Textbox(label="输出目录", interactive=True, show_copy_button=True)
-            logs = gr.Code(label="任务日志", language="shell", lines=10)
-            with gr.Row():
-                motion_file = gr.File(label="robot_motion.pkl")
-                video_file = gr.Video(label="robot_preview.mp4")
-                artifact_file = gr.File(label="artifacts.zip")
+            result_summary = gr.HTML("<div class='gmr-empty-note'>提交任务后这里会显示结果摘要。</div>")
+            video_file = gr.Video(
+                label="robot_preview.mp4",
+                height=360,
+                show_download_button=True,
+                elem_classes=["gmr-preview-video"],
+            )
+            with gr.Row(elem_classes=["gmr-download-row"]):
+                motion_download = gr.DownloadButton("下载 robot_motion.pkl")
+                video_download = gr.DownloadButton("下载 robot_preview.mp4")
+                artifact_download = gr.DownloadButton("下载 artifacts.zip", variant="primary")
+            with gr.Accordion("任务日志", open=False):
+                logs = gr.Code(label="任务日志", language="shell", lines=10)
 
         with gr.Tab("任务历史"):
             gr.Markdown("## 任务历史")
-            refresh = gr.Button("刷新历史")
             with gr.Row():
-                status_filter = gr.Dropdown(
-                    ["全部", "queued", "running", "succeeded", "failed", "cancelled"],
-                    value="全部",
-                    label="状态筛选",
+                refresh = gr.Button("刷新历史", variant="primary")
+                job_selector = gr.Dropdown(label="选择任务（不用从表格里复制）", choices=[])
+                selected_job = gr.Textbox(
+                    label="任务 ID（可复制 / 可手动输入）",
+                    interactive=True,
+                    show_copy_button=True,
                 )
-                source_filter = gr.Dropdown(
-                    ["全部"] + list(SOURCE_REGISTRY.keys()),
-                    value="全部",
-                    label="输入类型筛选",
-                )
-            jobs_table = gr.Dataframe(
-                headers=["job_id", "file", "source", "status", "postprocess", "submitted_at"],
-                interactive=False,
-            )
-            selected_job = gr.Textbox(label="输入任务 ID 查看详情")
             with gr.Row():
                 load_job = gr.Button("查看任务", variant="primary")
                 retry_job = gr.Button("重试任务")
                 cancel_job = gr.Button("取消任务")
                 postprocess_job = gr.Button("生成优化版", variant="primary")
-
-            gr.Markdown("### 任务摘要")
-            history_summary = gr.HTML("<div class='gmr-empty-note'>请选择一个任务查看详情。</div>")
-            history_status = gr.Textbox(label="历史状态", interactive=True, show_copy_button=True)
-            history_postprocess_status = gr.Textbox(label="后处理状态", interactive=True, show_copy_button=True)
 
             with gr.Accordion("高级后处理参数", open=False):
                 postprocess_profile = gr.Dropdown(
@@ -498,12 +653,45 @@ def build_ui(manager, gvhmr_manager=None):
                 )
                 postprocess_render = gr.Checkbox(value=True, label="生成优化版预览视频")
 
-            gr.Markdown("### 视频对比")
+            with gr.Accordion("任务列表与筛选", open=False):
+                with gr.Row():
+                    status_filter = gr.Dropdown(
+                        ["全部", "queued", "running", "succeeded", "failed", "cancelled"],
+                        value="全部",
+                        label="状态筛选",
+                    )
+                    source_filter = gr.Dropdown(
+                        ["全部"] + list(SOURCE_REGISTRY.keys()),
+                        value="全部",
+                        label="输入类型筛选",
+                    )
+                jobs_table = gr.Dataframe(
+                    headers=["job_id", "file", "source", "status", "postprocess", "submitted_at"],
+                    interactive=False,
+                )
+
+            gr.Markdown("### 任务摘要")
+            history_summary = gr.HTML("<div class='gmr-empty-note'>请选择一个任务查看详情。</div>")
             with gr.Row():
+                history_status = gr.Textbox(label="历史状态", interactive=True, show_copy_button=True)
+                history_postprocess_status = gr.Textbox(label="后处理状态", interactive=True, show_copy_button=True)
+
+            gr.HTML("<div class='gmr-section-title'>视频对比</div>")
+            with gr.Row(elem_classes=["gmr-sync-controls"]):
+                sync_play = gr.Button("同步播放 / 暂停", size="sm")
+                sync_seek = gr.Button("同步进度", size="sm")
+                reset_videos = gr.Button("重置到开头", size="sm")
+                playback_speed = gr.Dropdown(
+                    [("0.25x", "0.25"), ("0.5x", "0.5"), ("1x", "1"), ("1.5x", "1.5"), ("2x", "2")],
+                    value="1",
+                    label="播放速度",
+                    min_width=120,
+                )
+            with gr.Row(elem_classes=["gmr-video-compare"]):
                 history_video = gr.Video(label="原始预览 robot_preview.mp4", height=360, show_download_button=True)
                 history_optimized_video = gr.Video(label="优化预览 preview_foot.mp4", height=360, show_download_button=True)
 
-            gr.Markdown("### 下载与质量摘要")
+            gr.HTML("<div class='gmr-section-title'>下载与质量摘要</div>")
             with gr.Row():
                 history_motion_download = gr.DownloadButton("下载 robot_motion.pkl")
                 history_video_download = gr.DownloadButton("下载 robot_preview.mp4")
@@ -512,7 +700,9 @@ def build_ui(manager, gvhmr_manager=None):
                 history_optimized_video_download = gr.DownloadButton("下载 preview_foot.mp4")
                 history_quality_download = gr.DownloadButton("下载 quality_foot.json")
                 history_zip_download = gr.DownloadButton("下载 artifacts.zip", variant="primary")
-            history_quality_summary = gr.HTML("<div class='gmr-empty-note'>暂无优化质量报告。</div>")
+
+            with gr.Accordion("质量摘要", open=False):
+                history_quality_summary = gr.HTML("<div class='gmr-empty-note'>暂无优化质量报告。</div>")
 
             with gr.Accordion("高级信息：日志与任务详情", open=False):
                 history_logs = gr.Code(label="任务日志", language="shell", lines=10)
@@ -529,7 +719,7 @@ def build_ui(manager, gvhmr_manager=None):
 
         def submit_job(file_path, src_type, robot_name, clearance, smooth_alpha, make_video):
             if not file_path:
-                yield ("请先上传一个 pt 或 bvh 文件。", "", "", "", None, None, None)
+                yield _empty_run_tuple("请先上传一个 pt 或 bvh 文件。")
                 return
             try:
                 job = manager.submit_job(
@@ -541,21 +731,12 @@ def build_ui(manager, gvhmr_manager=None):
                     generate_video=make_video,
                 )
             except Exception as exc:
-                yield (f"提交失败：{exc}", "", "", "", None, None, None)
+                yield _empty_run_tuple(f"提交失败：{exc}")
                 return
 
             while True:
                 current = manager.get_job(job["job_id"])
-                motion, video, zip_file = _files(current)
-                yield (
-                    _status_text(current),
-                    current["job_id"],
-                    current["output_dir"],
-                    _logs(current),
-                    motion,
-                    video,
-                    zip_file,
-                )
+                yield _run_output_tuple(current)
                 if current["status"] in TERMINAL_STATUSES:
                     break
                 import time
@@ -580,18 +761,18 @@ def build_ui(manager, gvhmr_manager=None):
 
         def submit_gvhmr_result(gvhmr_job_id):
             if not gvhmr_job_id:
-                yield ("请先选择一个 GVHMR 成功任务。", "", "", "", None, None, None)
+                yield _empty_run_tuple("请先选择一个 GVHMR 成功任务。")
                 return
             gvhmr_job = gvhmr_manager.get_job(gvhmr_job_id)
             if gvhmr_job is None:
-                yield (f"GVHMR 任务不存在：{gvhmr_job_id}", "", "", "", None, None, None)
+                yield _empty_run_tuple(f"GVHMR 任务不存在：{gvhmr_job_id}")
                 return
             if gvhmr_job.get("status") != "succeeded":
-                yield ("GVHMR 任务还没有成功完成，不能转 ELF3。", "", "", "", None, None, None)
+                yield _empty_run_tuple("GVHMR 任务还没有成功完成，不能转 ELF3。")
                 return
             hmr4d_path = gvhmr_job.get("artifacts", {}).get("hmr4d_results_path")
             if not hmr4d_path or not Path(hmr4d_path).exists():
-                yield ("该 GVHMR 任务缺少 hmr4d_results.pt，不能转 ELF3。", "", "", "", None, None, None)
+                yield _empty_run_tuple("该 GVHMR 任务缺少 hmr4d_results.pt，不能转 ELF3。")
                 return
 
             try:
@@ -605,21 +786,12 @@ def build_ui(manager, gvhmr_manager=None):
                     display_name=_gvhmr_display_name(gvhmr_job),
                 )
             except Exception as exc:
-                yield (f"提交失败：{exc}", "", "", "", None, None, None)
+                yield _empty_run_tuple(f"提交失败：{exc}")
                 return
 
             while True:
                 current = manager.get_job(job["job_id"])
-                motion, video, zip_file = _files(current)
-                yield (
-                    _status_text(current),
-                    current["job_id"],
-                    current["output_dir"],
-                    _logs(current),
-                    motion,
-                    video,
-                    zip_file,
-                )
+                yield _run_output_tuple(current)
                 if current["status"] in TERMINAL_STATUSES:
                     break
                 import time
@@ -628,11 +800,17 @@ def build_ui(manager, gvhmr_manager=None):
 
         def refresh_history(status_value, source_value):
             rows = []
+            choices = []
             for job in manager.list_jobs(limit=50):
                 if status_value != "全部" and job["status"] != status_value:
                     continue
                 if source_value != "全部" and job["source_type"] != source_value:
                     continue
+                label = (
+                    f"{_display_file_name(job)} | {job['job_id']} | "
+                    f"{job['status']} | {_display_time(job.get('submitted_at'))}"
+                )
+                choices.append((label, job["job_id"]))
                 rows.append(
                     [
                         job["job_id"],
@@ -643,7 +821,11 @@ def build_ui(manager, gvhmr_manager=None):
                         _display_time(job.get("submitted_at")),
                     ]
                 )
-            return rows
+            first_job_id = choices[0][1] if choices else ""
+            return rows, gr.update(choices=choices, value=first_job_id or None), first_job_id
+
+        def fill_selected_job(job_id):
+            return job_id or ""
 
         def inspect_job(job_id):
             job_id = (job_id or "").strip()
@@ -710,7 +892,17 @@ def build_ui(manager, gvhmr_manager=None):
         submit.click(
             submit_job,
             inputs=[input_file, source_type, robot, ground_clearance, smoothing_alpha, generate_video],
-            outputs=[status, job_id, output_dir, logs, motion_file, video_file, artifact_file],
+            outputs=[
+                status,
+                job_id,
+                output_dir,
+                result_summary,
+                logs,
+                video_file,
+                motion_download,
+                video_download,
+                artifact_download,
+            ],
         )
         if gvhmr_manager is not None:
             refresh_gvhmr.click(refresh_gvhmr_results, outputs=[gvhmr_selector, gvhmr_detail])
@@ -722,13 +914,31 @@ def build_ui(manager, gvhmr_manager=None):
                     gvhmr_status,
                     gvhmr_gmr_job_id,
                     gvhmr_output_dir,
+                    gvhmr_result_summary,
                     gvhmr_logs,
-                    gvhmr_motion_file,
                     gvhmr_video_file,
-                    gvhmr_artifact_file,
+                    gvhmr_motion_download,
+                    gvhmr_video_download,
+                    gvhmr_artifact_download,
                 ],
             )
-        refresh.click(refresh_history, inputs=[status_filter, source_filter], outputs=[jobs_table])
+        sync_play.click(fn=None, inputs=[], outputs=[], js=SYNC_PLAY_JS, queue=False, show_api=False)
+        sync_seek.click(fn=None, inputs=[], outputs=[], js=SYNC_SEEK_JS, queue=False, show_api=False)
+        reset_videos.click(fn=None, inputs=[], outputs=[], js=RESET_VIDEOS_JS, queue=False, show_api=False)
+        playback_speed.change(
+            fn=None,
+            inputs=[playback_speed],
+            outputs=[],
+            js=SET_SPEED_JS,
+            queue=False,
+            show_api=False,
+        )
+        refresh.click(
+            refresh_history,
+            inputs=[status_filter, source_filter],
+            outputs=[jobs_table, job_selector, selected_job],
+        )
+        job_selector.change(fill_selected_job, inputs=[job_selector], outputs=[selected_job])
         load_job.click(
             inspect_job,
             inputs=[selected_job],

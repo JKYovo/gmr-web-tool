@@ -1,5 +1,7 @@
 # GMR Web Tool for ELF3
 
+[简体中文 README](README.zh-CN.md)
+
 This repository is a lightweight Web wrapper and tooling layer built on top of
 [GMR: General Motion Retargeting](https://github.com/YanjieZe/GMR).
 
@@ -11,6 +13,9 @@ It is used together with `gvhmr-web-tool`:
 ## What This Repo Adds
 
 - Local Gradio/FastAPI Web UI for ELF3 retargeting.
+- Compact job history with readable file names, copyable job IDs, and download buttons.
+- Optional optimized preview generation from `robot_motion.pkl`.
+- Side-by-side original/optimized preview video comparison with playback speed and sync controls.
 - One-command local start scripts:
   - `bash start_gmr_web.sh`
   - `bash start_gmr_web_lan.sh`
@@ -62,6 +67,19 @@ Default local URL:
 ```text
 http://127.0.0.1:7870/ui
 ```
+
+## Web Workflow
+
+The Web UI supports:
+
+- Uploading `hmr4d_results.pt`, SMPL-X `.npz`, BVH, or supported offline motion `.pkl` files.
+- Selecting ELF3 source mappings such as `gvhmr_smplx`, `bvh_xsens`, `bvh_lafan1`, and `bvh_nokov`.
+- Generating the original GMR outputs: `robot_motion.pkl`, `robot_preview.mp4`, and `artifacts.zip`.
+- Manually generating optimized preview outputs: `motion_foot.pkl`, `preview_foot.mp4`, and `quality_foot.json`.
+- Comparing original and optimized videos in the history page with synchronized play/pause, seek sync, reset, and playback speed controls.
+
+The task history is stored under `runtime/db/`, and per-job artifacts are stored
+under `runtime/jobs/`. These runtime folders are intentionally ignored by git.
 
 ## Motion Post-Processing
 
