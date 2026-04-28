@@ -26,6 +26,17 @@ It is used together with `gvhmr-web-tool`:
   - `tools/optimize_robot_motion.py`
 - ELF3 IK configuration files under `general_motion_retargeting/ik_configs/`.
 
+## Preview
+
+The video below compares the original GMR preview with the optimized
+post-processed preview on the same BVH motion.
+
+<video src="https://github.com/JKYovo/gmr-web-tool/raw/main/docs/media/balei_original_vs_postprocess.mp4" controls width="960"></video>
+
+Left: original `robot_preview.mp4`. Right: optimized `preview_foot.mp4`.
+
+[Open preview MP4](docs/media/balei_original_vs_postprocess.mp4)
+
 ## Important: ELF3 Assets Are Not Public
 
 `assets/elf3/` is intentionally not included in this public repository.
@@ -43,8 +54,9 @@ assets/elf3/elf3.xml
 assets/elf3/meshes/*.STL
 ```
 
-Runtime outputs, videos, pkl files, checkpoints, SMPLX body models, SQLite
-databases, and job folders are also ignored by git.
+Runtime outputs, pkl files, checkpoints, SMPLX body models, SQLite databases,
+and job folders are ignored by git. Only small documentation previews under
+`docs/media/` are allowed in the repository.
 
 ## Quick Start
 

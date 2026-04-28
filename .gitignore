@@ -54,6 +54,7 @@ exports/
 *.wmv
 *.flv
 *.webm
+!docs/media/*.mp4
 
 # Archives
 *.zip

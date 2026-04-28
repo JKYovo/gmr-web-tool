@@ -19,6 +19,16 @@
 - 视频对比支持同步播放、同步进度、重置和倍速播放。
 - ELF3 相关 IK 配置文件。
 
+## 效果预览
+
+下面的视频展示同一个 BVH 动作在 GMR 原始结果和后处理优化结果之间的对比。
+
+<video src="https://github.com/JKYovo/gmr-web-tool/raw/main/docs/media/balei_original_vs_postprocess.mp4" controls width="960"></video>
+
+左侧：原始 `robot_preview.mp4`。右侧：优化后的 `preview_foot.mp4`。
+
+[打开预览 MP4](docs/media/balei_original_vs_postprocess.mp4)
+
 ## 重要说明：ELF3 资产不公开
 
 `assets/elf3/` 不会提交到 public 仓库。
@@ -41,10 +51,11 @@ assets/elf3/meshes/*.STL
 - `runtime/`
 - `outputs/`
 - `exports/`
-- 视频文件
 - `pkl / pt / ckpt`
 - SQLite 数据库
 - SMPLX body model
+
+只有 `docs/media/` 里的小体积说明视频会进入仓库，用于 README 展示。
 
 ## 启动方式
 
@@ -188,4 +199,3 @@ gvhmr-web-tool
 ```text
 https://github.com/YanjieZe/GMR
 ```
-
