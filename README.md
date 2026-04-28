@@ -65,6 +65,12 @@ http://127.0.0.1:7870/ui
 
 ## Motion Post-Processing
 
+Detailed Chinese guide:
+
+```text
+tools/README_motion_postprocess.md
+```
+
 Quality report only:
 
 ```bash
@@ -80,7 +86,16 @@ PYTHONNOUSERSITE=1 conda run -n gvhmr python tools/motion_postprocess.py optimiz
   --input runtime/jobs/xxx/robot_motion.pkl \
   --robot elf3 \
   --profile soft \
+  --pipeline v2_foot \
   --render
+```
+
+Default recommended outputs:
+
+```text
+motion_foot.pkl
+preview_foot.mp4
+quality_foot.json
 ```
 
 ## Upstream
