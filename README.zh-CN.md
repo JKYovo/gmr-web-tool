@@ -21,13 +21,13 @@
 
 ## 效果预览
 
-下面的视频展示同一个 BVH 动作在 GMR 原始结果和后处理优化结果之间的对比。
+下面的 GIF 展示同一个 BVH 动作在 GMR 原始结果和后处理优化结果之间的对比。
 
-<video src="https://github.com/JKYovo/gmr-web-tool/raw/main/docs/media/balei_original_vs_postprocess.mp4" controls width="960"></video>
+<img src="docs/media/balei_original_vs_postprocess.gif" alt="GMR 原始预览和后处理优化预览对比" width="960">
 
 左侧：原始 `robot_preview.mp4`。右侧：优化后的 `preview_foot.mp4`。
 
-[打开预览 MP4](docs/media/balei_original_vs_postprocess.mp4)
+[打开完整 MP4 预览](docs/media/balei_original_vs_postprocess.mp4)
 
 ## 重要说明：ELF3 资产不公开
 

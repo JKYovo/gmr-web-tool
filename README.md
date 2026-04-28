@@ -28,14 +28,14 @@ It is used together with `gvhmr-web-tool`:
 
 ## Preview
 
-The video below compares the original GMR preview with the optimized
+The GIF below compares the original GMR preview with the optimized
 post-processed preview on the same BVH motion.
 
-<video src="https://github.com/JKYovo/gmr-web-tool/raw/main/docs/media/balei_original_vs_postprocess.mp4" controls width="960"></video>
+<img src="docs/media/balei_original_vs_postprocess.gif" alt="Original GMR preview versus post-processed preview" width="960">
 
 Left: original `robot_preview.mp4`. Right: optimized `preview_foot.mp4`.
 
-[Open preview MP4](docs/media/balei_original_vs_postprocess.mp4)
+[Open the full MP4 preview](docs/media/balei_original_vs_postprocess.mp4)
 
 ## Important: ELF3 Assets Are Not Public
 
