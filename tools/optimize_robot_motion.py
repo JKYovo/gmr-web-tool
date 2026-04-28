@@ -17,6 +17,7 @@ def main() -> None:
     parser.add_argument("--output", required=True)
     parser.add_argument("--robot", default="elf3")
     parser.add_argument("--profile", default="preview", choices=["preview", "soft", "strict"])
+    parser.add_argument("--pipeline", default="v2", choices=["legacy", "v2"])
     parser.add_argument("--quality-json", default=None)
     parser.add_argument("--render", action="store_true")
     parser.add_argument("--video-output", default=None)
@@ -41,6 +42,8 @@ def main() -> None:
         args.robot,
         "--profile",
         args.profile,
+        "--pipeline",
+        args.pipeline,
         "--width",
         str(args.width),
         "--height",

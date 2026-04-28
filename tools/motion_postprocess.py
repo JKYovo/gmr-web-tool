@@ -148,6 +148,7 @@ PROFILES = {
 # 脚底指标尽量兼容不同机器人模型：如果模型里没有匹配到脚/脚踝相关 body，
 # 报告里会标记 contact unavailable，而不是让整个任务失败。
 FOOT_NAME_HINTS = ("foot", "toe", "sole", "ankle")
+ARM_NAME_HINTS = ("shoulder", "elbow", "wrist")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -171,6 +172,12 @@ def build_parser() -> argparse.ArgumentParser:
         default="preview",
         choices=sorted(PROFILES),
         help="Optimization profile.",
+    )
+    optimize.add_argument(
+        "--pipeline",
+        default="v2",
+        choices=["legacy", "v2"],
+        help="Optimization pipeline. legacy keeps the old full smoothing behavior; v2 focuses on arm jitter cleanup.",
     )
     optimize.add_argument(
         "--output",
@@ -306,6 +313,11 @@ def smooth_window_for_joint(name: str, profile: Profile) -> int:
     return profile.default_window
 
 
+def is_arm_joint(name: str) -> bool:
+    name = name.lower()
+    return any(hint in name for hint in ARM_NAME_HINTS)
+
+
 def odd_window(window: int, length: int) -> int:
     if length < 3:
         return 1
@@ -358,6 +370,86 @@ def velocity_limited_path(values: np.ndarray, max_delta: np.ndarray) -> np.ndarr
         backward[i] = backward[i + 1] + delta
 
     return 0.5 * (forward + backward)
+
+
+def detect_spike_frames(
+    dof_pos: np.ndarray,
+    fps: int,
+    joints: list[JointInfo],
+) -> tuple[np.ndarray, dict[str, Any]]:
+    # 把速度、加速度、jerk 超阈值的位置映射回原始帧，用于报告里定位
+    # 哪些关节/帧最容易抽动。
+    frame_mask = np.zeros_like(dof_pos, dtype=bool)
+    velocity = derivative_abs(dof_pos, fps, order=1)
+    acceleration = derivative_abs(dof_pos, fps, order=2)
+    jerk = derivative_abs(dof_pos, fps, order=3)
+    stats: dict[str, Any] = {
+        "velocity_events": 0,
+        "acceleration_events": 0,
+        "jerk_events": 0,
+        "per_joint_spike_frames": {},
+    }
+
+    derivative_specs = (
+        ("velocity_events", velocity, 1, [joint.velocity_limit for joint in joints]),
+        ("acceleration_events", acceleration, 2, [joint.accel_limit for joint in joints]),
+        ("jerk_events", jerk, 3, [joint.jerk_limit for joint in joints]),
+    )
+    for event_key, derivative, order, limits in derivative_specs:
+        if derivative.size == 0:
+            continue
+        for joint, limit in zip(joints, limits):
+            spike_indices = np.flatnonzero(derivative[:, joint.dof_index] > float(limit))
+            if len(spike_indices) == 0:
+                continue
+            radius = spike_radius_for_joint(joint.name, fps)
+            stats[event_key] += int(len(spike_indices))
+            for index in spike_indices:
+                start = max(0, int(index) - radius)
+                end = min(len(dof_pos), int(index) + order + radius + 1)
+                frame_mask[start:end, joint.dof_index] = True
+
+    for joint in joints:
+        stats["per_joint_spike_frames"][joint.name] = int(
+            np.count_nonzero(frame_mask[:, joint.dof_index])
+        )
+    stats["spike_frame_count"] = int(np.count_nonzero(np.any(frame_mask, axis=1)))
+    stats["spike_value_count"] = int(np.count_nonzero(frame_mask))
+    return frame_mask, stats
+
+
+def spike_radius_for_joint(name: str, fps: int) -> int:
+    if is_arm_joint(name):
+        return max(1, int(round(0.04 * fps)))
+    return max(1, int(round(0.02 * fps)))
+
+
+def smooth_arm_joints_extra(
+    dof_pos: np.ndarray,
+    joints: list[JointInfo],
+) -> tuple[np.ndarray, dict[str, Any]]:
+    # 实测更稳的 V2 策略：先用 legacy 得到一个合法稳定的基底，
+    # 再只对肩/肘/腕额外平滑。这样不会把下肢和 root 一起磨软。
+    result = dof_pos.copy()
+    stats: dict[str, Any] = {
+        "arm_extra_smooth_joints": {},
+        "arm_extra_smooth_joint_count": 0,
+        "arm_extra_smooth_frames": 0,
+    }
+    for joint in joints:
+        if not is_arm_joint(joint.name):
+            continue
+        window = min(joint.smooth_window + 8, 31)
+        before = result[:, joint.dof_index].copy()
+        result[:, joint.dof_index] = centered_smooth(before, window)
+        changed = int(np.count_nonzero(np.abs(result[:, joint.dof_index] - before) > 1e-9))
+        stats["arm_extra_smooth_joints"][joint.name] = {
+            "window": int(odd_window(window, len(result))),
+            "changed_frames": changed,
+        }
+        stats["arm_extra_smooth_joint_count"] += 1
+        stats["arm_extra_smooth_frames"] += changed
+    return result, stats
 
 
 def normalize_quat_xyzw(quat: np.ndarray) -> np.ndarray:
@@ -433,6 +525,20 @@ def optimize_motion(
     *,
     robot: str,
     profile_name: str,
+    pipeline_name: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    if pipeline_name == "legacy":
+        return optimize_motion_legacy(motion, robot=robot, profile_name=profile_name)
+    if pipeline_name == "v2":
+        return optimize_motion_v2(motion, robot=robot, profile_name=profile_name)
+    raise ValueError(f"Unsupported pipeline: {pipeline_name}")
+
+
+def optimize_motion_legacy(
+    motion: dict[str, Any],
+    *,
+    robot: str,
+    profile_name: str,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     profile = PROFILES[profile_name]
     model = load_robot_model(robot)
@@ -490,6 +596,92 @@ def optimize_motion(
         after=after,
         clipped_values=clipped_values,
         ground_z_shift=ground_z_shift,
+        pipeline_name="legacy",
+        optimizer_version="legacy_full_smooth",
+        repair={},
+    )
+    return optimized, report
+
+
+def optimize_motion_v2(
+    motion: dict[str, Any],
+    *,
+    robot: str,
+    profile_name: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    profile = PROFILES[profile_name]
+    model = load_robot_model(robot)
+    fps, root_pos, root_rot, dof_pos = parse_motion_arrays(motion)
+    joints = get_joint_info(model, dof_pos.shape[1], profile)
+    before = quality_metrics(root_pos, root_rot, dof_pos, fps, joints, model)
+
+    # V2 的重点是手臂抽动优先：先沿用 legacy 得到一个合法稳定的全身基底，
+    # 再只对肩/肘/腕做额外平滑。这样比全身强平滑更能保留下肢和 root 节奏。
+    spike_mask, spike_stats = detect_spike_frames(dof_pos, fps, joints)
+    max_delta = np.asarray([joint.velocity_limit / fps for joint in joints], dtype=np.float64)
+    limited_dof = velocity_limited_path(dof_pos, max_delta)
+
+    stable_dof = limited_dof.copy()
+    for joint in joints:
+        stable_dof[:, joint.dof_index] = centered_smooth(
+            limited_dof[:, joint.dof_index], joint.smooth_window
+        )
+    stable_dof, base_clipped_values = clip_dof(stable_dof, joints)
+
+    arm_smoothed_dof, arm_smooth_stats = smooth_arm_joints_extra(stable_dof, joints)
+    smoothed_dof, clipped_values = clip_dof(arm_smoothed_dof, joints)
+
+    smoothed_root_pos = root_pos.copy()
+    root_window = min(profile.root_window, 7)
+    smoothed_root_pos[:, 2] = centered_smooth(root_pos[:, 2], root_window)
+    smoothed_root_rot = smooth_quat_xyzw(root_rot, root_window)
+    ground_z_shift = preserve_min_foot_height(
+        model,
+        root_pos,
+        root_rot,
+        dof_pos,
+        smoothed_root_pos,
+        smoothed_root_rot,
+        smoothed_dof,
+    )
+
+    optimized = dict(motion)
+    optimized["root_pos"] = smoothed_root_pos.astype(np.asarray(motion["root_pos"]).dtype, copy=False)
+    optimized["root_rot"] = smoothed_root_rot.astype(np.asarray(motion["root_rot"]).dtype, copy=False)
+    optimized["dof_pos"] = smoothed_dof.astype(np.asarray(motion["dof_pos"]).dtype, copy=False)
+
+    after = quality_metrics(smoothed_root_pos, smoothed_root_rot, smoothed_dof, fps, joints, model)
+    repair = {
+        **spike_stats,
+        **arm_smooth_stats,
+        "base_clipped_values": int(base_clipped_values),
+        "final_clipped_values": int(clipped_values),
+        "arm_spike_value_count": int(
+            sum(
+                np.count_nonzero(spike_mask[:, joint.dof_index])
+                for joint in joints
+                if is_arm_joint(joint.name)
+            )
+        ),
+    }
+    report = build_report(
+        robot=robot,
+        profile_name=profile_name,
+        fps=fps,
+        root_pos=root_pos,
+        root_rot=root_rot,
+        dof_pos=dof_pos,
+        optimized_root_pos=smoothed_root_pos,
+        optimized_root_rot=smoothed_root_rot,
+        optimized_dof_pos=smoothed_dof,
+        joints=joints,
+        before=before,
+        after=after,
+        clipped_values=clipped_values,
+        ground_z_shift=ground_z_shift,
+        pipeline_name="v2",
+        optimizer_version="v2_arm_spike",
+        repair=repair,
     )
     return optimized, report
 
@@ -514,6 +706,8 @@ def build_report(
     *,
     robot: str,
     profile_name: str,
+    pipeline_name: str,
+    optimizer_version: str,
     fps: int,
     root_pos: np.ndarray,
     root_rot: np.ndarray,
@@ -526,18 +720,22 @@ def build_report(
     after: dict[str, Any],
     clipped_values: int,
     ground_z_shift: float,
+    repair: dict[str, Any],
 ) -> dict[str, Any]:
     root_rot_delta = quat_pair_angle_diff_xyzw(root_rot, optimized_root_rot)
     return {
         "robot": robot,
         "mode": "optimize",
         "profile": profile_name,
+        "pipeline": pipeline_name,
+        "optimizer_version": optimizer_version,
         "frames": int(len(dof_pos)),
         "fps": fps,
         "joint_count": int(dof_pos.shape[1]),
         "joint_names": [joint.name for joint in joints],
         "clipped_values": int(clipped_values),
         "ground_z_shift": float(ground_z_shift),
+        "repair": repair,
         "change": {
             "mean_abs_dof_change": float(np.mean(np.abs(optimized_dof_pos - dof_pos))),
             "max_abs_dof_change": max_value(np.abs(optimized_dof_pos - dof_pos)),
@@ -838,7 +1036,12 @@ def run_optimize(args: argparse.Namespace) -> None:
         raise ValueError("Refusing to overwrite the input pkl. Please choose a different output path.")
 
     motion = load_motion(input_path)
-    optimized, report = optimize_motion(motion, robot=args.robot, profile_name=args.profile)
+    optimized, report = optimize_motion(
+        motion,
+        robot=args.robot,
+        profile_name=args.profile,
+        pipeline_name=args.pipeline,
+    )
     report["input"] = str(input_path)
     report["output"] = str(output_path)
     save_motion(output_path, optimized)
