@@ -1,8 +1,13 @@
 from pathlib import Path
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 import gradio as gr
 
 from gmr_web.common import SOURCE_REGISTRY, SUPPORTED_ROBOTS, TERMINAL_STATUSES, UPLOAD_SOURCE_TYPES
+
+
+LOCAL_TZ = ZoneInfo("Asia/Shanghai")
 
 
 def _logs(job):
@@ -30,6 +35,40 @@ def _status_text(job):
     return "任务完成"
 
 
+def _path_name(value):
+    if not value:
+        return ""
+    return Path(str(value)).name
+
+
+def _display_file_name(job):
+    for key in ("display_name", "source_input_file", "input_file"):
+        name = _path_name(job.get(key))
+        if name:
+            return name
+    return "-"
+
+
+def _display_time(value):
+    if not value:
+        return "-"
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(LOCAL_TZ).strftime("%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return str(value)
+
+
+def _gvhmr_display_name(job):
+    for key in ("display_name", "source_video_path", "source_input_file", "input_video", "video_path"):
+        name = _path_name(job.get(key))
+        if name:
+            return name
+    return _path_name(job.get("output_dir")) or job.get("job_id", "GVHMR 结果")
+
+
 def _format_job_detail(job):
     if not job:
         return ""
@@ -39,7 +78,10 @@ def _format_job_detail(job):
         f"source_type: {job['source_type']}",
         f"robot: {job['robot']}",
         f"ik_config: {job.get('ik_config')}",
-        f"input_file: {job['input_file']}",
+        f"display_name: {_display_file_name(job)}",
+        f"submitted_at: {_display_time(job.get('submitted_at'))}",
+        f"source_input_file: {job.get('source_input_file')}",
+        f"staged_input_file: {job['input_file']}",
         f"output_dir: {job['output_dir']}",
         f"ground_clearance: {job['ground_clearance']}",
         f"smoothing_alpha: {job['smoothing_alpha']}",
@@ -57,8 +99,8 @@ def _gvhmr_result_choices(gvhmr_manager):
         hmr4d_path = job.get("artifacts", {}).get("hmr4d_results_path")
         if job.get("status") != "succeeded" or not hmr4d_path or not Path(hmr4d_path).exists():
             continue
-        video_name = Path(job.get("source_video_path") or job.get("input_video") or job["output_dir"]).name
-        label = f"{video_name} | {job['job_id']} | {job['submitted_at']}"
+        video_name = _gvhmr_display_name(job)
+        label = f"{video_name} | {job['job_id']} | {_display_time(job.get('submitted_at'))}"
         choices.append((label, job["job_id"]))
     return choices
 
@@ -70,7 +112,8 @@ def _format_gvhmr_result(job):
     lines = [
         f"GVHMR job_id: {job['job_id']}",
         f"status: {job['status']}",
-        f"video: {Path(job.get('source_video_path') or job.get('input_video') or '').name}",
+        f"video: {_gvhmr_display_name(job)}",
+        f"submitted_at: {_display_time(job.get('submitted_at'))}",
         f"hmr4d_results.pt: {hmr4d_path or '缺失'}",
         f"output_dir: {job['output_dir']}",
     ]
@@ -255,6 +298,7 @@ def build_ui(manager, gvhmr_manager=None):
                     ground_clearance=0.03,
                     smoothing_alpha=0.35,
                     generate_video=True,
+                    display_name=_gvhmr_display_name(gvhmr_job),
                 )
             except Exception as exc:
                 yield (f"提交失败：{exc}", "", "", "", None, None, None)
@@ -288,10 +332,10 @@ def build_ui(manager, gvhmr_manager=None):
                 rows.append(
                     [
                         job["job_id"],
-                        Path(job["input_file"]).name,
+                        _display_file_name(job),
                         job["source_type"],
                         job["status"],
-                        job["submitted_at"],
+                        _display_time(job.get("submitted_at")),
                     ]
                 )
             return rows

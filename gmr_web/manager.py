@@ -50,6 +50,7 @@ class JobManager:
         ground_clearance=0.03,
         generate_video=True,
         smoothing_alpha=0.35,
+        display_name=None,
     ):
         input_path = Path(input_file).expanduser().resolve()
         resolved_source_type = infer_source_type(input_path, source_type)
@@ -68,6 +69,7 @@ class JobManager:
             "ik_config": str(source_config_path(resolved_source_type)),
             "source_input_file": str(input_path),
             "input_file": str(staged_input),
+            "display_name": display_name or input_path.name,
             "output_dir": str(output_dir),
             "ground_clearance": float(ground_clearance),
             "smoothing_alpha": float(smoothing_alpha),

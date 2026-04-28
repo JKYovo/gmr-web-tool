@@ -21,6 +21,7 @@ class JobCreateRequest(BaseModel):
     ground_clearance: float = 0.03
     generate_video: bool = True
     smoothing_alpha: float = 0.35
+    display_name: str | None = None
 
 
 def create_components():
@@ -116,4 +117,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
