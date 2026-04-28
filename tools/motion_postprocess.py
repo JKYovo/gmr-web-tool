@@ -1170,11 +1170,11 @@ def apply_light_foot_lock(
     correction_sum = np.zeros((len(root_pos), 2), dtype=np.float64)
     correction_weight = np.zeros((len(root_pos),), dtype=np.float64)
 
-    strength = 1.0
+    strength = 0.65
     max_segment_correction = 0.08
     max_step = 0.006
-    smooth_window = max(3, int(round(0.08 * fps)))
-    ramp_frames = max(2, int(round(0.05 * fps)))
+    smooth_window = max(3, int(round(0.12 * fps)))
+    ramp_frames = max(2, int(round(0.08 * fps)))
     total_segments = 0
     skipped_segments = 0
 
