@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
@@ -8,10 +9,70 @@ from gmr_web.common import SOURCE_REGISTRY, SUPPORTED_ROBOTS, TERMINAL_STATUSES,
 
 
 LOCAL_TZ = ZoneInfo("Asia/Shanghai")
+RENDER_LOG_RE = re.compile(r"^\[Render\]\s+(\d+)/(\d+)")
+RETARGET_LOG_RE = re.compile(r"^\[GMR\]\s+Retarget\s+(\d+)/(\d+)")
+MAX_PROGRESS_LOGS = 10
+SELECTABLE_OUTPUT_CSS = """
+.gradio-container, .gradio-container * {
+  user-select: text !important;
+  -webkit-user-select: text !important;
+}
+textarea, input, pre, code, .cm-content, .cm-line {
+  user-select: text !important;
+  -webkit-user-select: text !important;
+}
+"""
+
+
+def _progress_log_key(line):
+    line_text = str(line)
+    if match := RENDER_LOG_RE.match(line_text):
+        return ("render", int(match.group(2)))
+    if match := RETARGET_LOG_RE.match(line_text):
+        return ("retarget", int(match.group(2)))
+    return None
+
+
+def _sample_progress_lines(lines):
+    if len(lines) <= MAX_PROGRESS_LOGS:
+        return list(lines), 0
+    span = len(lines) - 1
+    indices = sorted({round(idx * span / (MAX_PROGRESS_LOGS - 1)) for idx in range(MAX_PROGRESS_LOGS)})
+    return [lines[index] for index in indices], len(lines) - len(indices)
 
 
 def _logs(job):
-    return "\n".join(job.get("logs", []))
+    logs = job.get("logs", [])
+    compacted = []
+    progress_buffer = []
+    progress_key = None
+    skipped_progress_logs = 0
+
+    def flush_progress_buffer():
+        nonlocal progress_buffer, progress_key, skipped_progress_logs
+        if not progress_buffer:
+            return
+        sampled, skipped = _sample_progress_lines(progress_buffer)
+        compacted.extend(sampled)
+        skipped_progress_logs += skipped
+        progress_buffer = []
+        progress_key = None
+
+    for line in logs:
+        key = _progress_log_key(line)
+        if key is None:
+            flush_progress_buffer()
+            compacted.append(line)
+            continue
+        if progress_buffer and key != progress_key:
+            flush_progress_buffer()
+        progress_buffer.append(line)
+        progress_key = key
+
+    flush_progress_buffer()
+    if skipped_progress_logs:
+        compacted.append(f"[Progress] 已隐藏 {skipped_progress_logs} 条中间进度日志。")
+    return "\n".join(str(line) for line in compacted)
 
 
 def _files(job):
@@ -20,6 +81,16 @@ def _files(job):
         artifacts.get("motion_path"),
         artifacts.get("video_path"),
         artifacts.get("artifacts_zip_path"),
+    )
+
+
+def _postprocess_files(job):
+    artifacts = job.get("artifacts", {})
+    postprocess_artifacts = job.get("postprocess_artifacts") or {}
+    return (
+        postprocess_artifacts.get("optimized_motion_path") or artifacts.get("optimized_motion_path"),
+        postprocess_artifacts.get("optimized_video_path") or artifacts.get("optimized_video_path"),
+        postprocess_artifacts.get("quality_report_path") or artifacts.get("quality_report_path"),
     )
 
 
@@ -33,6 +104,21 @@ def _status_text(job):
     if job["status"] == "cancelled":
         return "任务已取消"
     return "任务完成"
+
+
+def _postprocess_status_text(job):
+    status = job.get("postprocess_status")
+    if not status:
+        return "尚未生成优化版"
+    if status == "queued":
+        return "后处理已入队"
+    if status == "running":
+        return "后处理中"
+    if status == "failed":
+        return f"后处理失败：{job.get('postprocess_error') or '未知错误'}"
+    if status == "succeeded":
+        return "优化版已生成"
+    return str(status)
 
 
 def _path_name(value):
@@ -87,8 +173,30 @@ def _format_job_detail(job):
         f"smoothing_alpha: {job['smoothing_alpha']}",
         f"generate_video: {job['generate_video']}",
         f"error_summary: {job.get('error_summary')}",
+        f"postprocess_status: {job.get('postprocess_status')}",
+        f"postprocess_profile: {job.get('postprocess_profile')}",
+        f"postprocess_pipeline: {job.get('postprocess_pipeline')}",
+        f"postprocess_render: {job.get('postprocess_render')}",
+        f"postprocess_error: {job.get('postprocess_error')}",
     ]
     return "\n".join(lines)
+
+
+def _job_output_tuple(job, status_message=None, postprocess_message=None):
+    motion, video, zip_file = _files(job)
+    optimized_motion, optimized_video, quality_report = _postprocess_files(job)
+    return (
+        status_message or _status_text(job),
+        postprocess_message or _postprocess_status_text(job),
+        _format_job_detail(job),
+        _logs(job),
+        motion,
+        video,
+        optimized_motion,
+        optimized_video,
+        quality_report,
+        zip_file,
+    )
 
 
 def _gvhmr_result_choices(gvhmr_manager):
@@ -143,7 +251,7 @@ def build_ui(manager, gvhmr_manager=None):
     gvhmr_choices = _gvhmr_result_choices(gvhmr_manager)
     gvhmr_initial = gvhmr_choices[0][1] if gvhmr_choices else None
 
-    with gr.Blocks(title="GMR Web") as app:
+    with gr.Blocks(title="GMR Web", css=SELECTABLE_OUTPUT_CSS) as app:
         gr.Markdown("# GMR Web")
         gr.Markdown("内部 ELF3 机器人动作转换工具：上传人体动作文件，后台生成机器人 `pkl` 和可选预览视频。")
 
@@ -158,11 +266,11 @@ def build_ui(manager, gvhmr_manager=None):
                         value=gvhmr_initial,
                     )
                     submit_gvhmr = gr.Button("使用该结果转 ELF3", variant="primary")
-                gvhmr_detail = gr.Textbox(label="GVHMR 结果详情", lines=5, interactive=False)
-                gvhmr_status = gr.Textbox(label="任务状态", interactive=False)
-                gvhmr_gmr_job_id = gr.Textbox(label="GMR 任务 ID", interactive=False)
-                gvhmr_output_dir = gr.Textbox(label="GMR 输出目录", interactive=False)
-                gvhmr_logs = gr.Textbox(label="GMR 任务日志", lines=10, interactive=False)
+                gvhmr_detail = gr.Code(label="GVHMR 结果详情", language="shell", lines=5)
+                gvhmr_status = gr.Textbox(label="任务状态", interactive=True, show_copy_button=True)
+                gvhmr_gmr_job_id = gr.Textbox(label="GMR 任务 ID", interactive=True, show_copy_button=True)
+                gvhmr_output_dir = gr.Textbox(label="GMR 输出目录", interactive=True, show_copy_button=True)
+                gvhmr_logs = gr.Code(label="GMR 任务日志", language="shell", lines=10)
                 with gr.Row():
                     gvhmr_motion_file = gr.File(label="robot_motion.pkl")
                     gvhmr_video_file = gr.Video(label="robot_preview.mp4")
@@ -179,10 +287,10 @@ def build_ui(manager, gvhmr_manager=None):
                     generate_video = gr.Checkbox(value=True, label="生成预览视频")
                     submit = gr.Button("提交转换", variant="primary")
 
-            status = gr.Textbox(label="任务状态", interactive=False)
-            job_id = gr.Textbox(label="任务 ID", interactive=False)
-            output_dir = gr.Textbox(label="输出目录", interactive=False)
-            logs = gr.Textbox(label="任务日志", lines=10, interactive=False)
+            status = gr.Textbox(label="任务状态", interactive=True, show_copy_button=True)
+            job_id = gr.Textbox(label="任务 ID", interactive=True, show_copy_button=True)
+            output_dir = gr.Textbox(label="输出目录", interactive=True, show_copy_button=True)
+            logs = gr.Code(label="任务日志", language="shell", lines=10)
             with gr.Row():
                 motion_file = gr.File(label="robot_motion.pkl")
                 video_file = gr.Video(label="robot_preview.mp4")
@@ -201,17 +309,41 @@ def build_ui(manager, gvhmr_manager=None):
                     value="全部",
                     label="输入类型筛选",
                 )
-            jobs_table = gr.Dataframe(headers=["job_id", "file", "source", "status", "submitted_at"], interactive=False)
+            jobs_table = gr.Dataframe(
+                headers=["job_id", "file", "source", "status", "postprocess", "submitted_at"],
+                interactive=False,
+            )
             selected_job = gr.Textbox(label="输入任务 ID 查看详情")
             load_job = gr.Button("查看任务")
             retry_job = gr.Button("重试任务")
             cancel_job = gr.Button("取消任务")
-            history_status = gr.Textbox(label="历史状态", interactive=False)
-            job_detail = gr.Textbox(label="任务详情", lines=10, interactive=False)
-            history_logs = gr.Textbox(label="任务日志", lines=10, interactive=False)
+            history_status = gr.Textbox(label="历史状态", interactive=True, show_copy_button=True)
+            history_postprocess_status = gr.Textbox(label="后处理状态", interactive=True, show_copy_button=True)
+            with gr.Accordion("高级后处理参数", open=False):
+                postprocess_profile = gr.Dropdown(
+                    ["soft", "preview", "strict"],
+                    value="soft",
+                    label="平滑强度 profile",
+                )
+                postprocess_pipeline = gr.Dropdown(
+                    [("综合优化 v2_foot（推荐）", "v2_foot"), ("只做关节平滑 v2", "v2")],
+                    value="v2_foot",
+                    label="优化流程 pipeline",
+                )
+                postprocess_render = gr.Checkbox(value=True, label="生成优化版预览视频")
+            postprocess_job = gr.Button("生成优化版", variant="primary")
+            job_detail = gr.Code(label="任务详情", language="shell", lines=10)
+            history_logs = gr.Code(label="任务日志", language="shell", lines=10)
+            gr.Markdown("### 原始结果")
             with gr.Row():
                 history_motion = gr.File(label="robot_motion.pkl")
                 history_video = gr.Video(label="robot_preview.mp4")
+            gr.Markdown("### 优化结果")
+            with gr.Row():
+                history_optimized_motion = gr.File(label="优化版 motion pkl")
+                history_optimized_video = gr.Video(label="优化版 preview mp4")
+                history_quality = gr.File(label="质量报告 json")
+            with gr.Row():
                 history_zip = gr.File(label="artifacts.zip")
 
         with gr.Tab("配置说明"):
@@ -335,6 +467,7 @@ def build_ui(manager, gvhmr_manager=None):
                         _display_file_name(job),
                         job["source_type"],
                         job["status"],
+                        job.get("postprocess_status") or "-",
                         _display_time(job.get("submitted_at")),
                     ]
                 )
@@ -343,32 +476,63 @@ def build_ui(manager, gvhmr_manager=None):
         def inspect_job(job_id):
             job_id = (job_id or "").strip()
             if not job_id:
-                return ("请输入任务 ID。", "", "", None, None, None)
+                return ("请输入任务 ID。", "", "", "", None, None, None, None, None, None)
             job = manager.get_job(job_id)
             if job is None:
-                return (f"任务不存在：{job_id}", "", "", None, None, None)
-            motion, video, zip_file = _files(job)
-            return (_status_text(job), _format_job_detail(job), _logs(job), motion, video, zip_file)
+                return (f"任务不存在：{job_id}", "", "", "", None, None, None, None, None, None)
+            return _job_output_tuple(job)
+
+        def request_postprocess_selected(job_id, profile, pipeline, render):
+            job_id = (job_id or "").strip()
+            if not job_id:
+                yield ("请输入任务 ID。", "", "", "", None, None, None, None, None, None)
+                return
+            try:
+                job = manager.request_postprocess(
+                    job_id,
+                    profile=profile,
+                    pipeline=pipeline,
+                    render=render,
+                )
+            except Exception as exc:
+                existing = manager.get_job(job_id)
+                if existing is None:
+                    yield (f"后处理提交失败：{exc}", "", "", "", None, None, None, None, None, None)
+                else:
+                    yield _job_output_tuple(existing, postprocess_message=f"后处理提交失败：{exc}")
+                return
+            if job is None:
+                yield (f"任务不存在：{job_id}", "", "", "", None, None, None, None, None, None)
+                return
+
+            while True:
+                current = manager.get_job(job["job_id"])
+                yield _job_output_tuple(current)
+                if current.get("postprocess_status") in {"succeeded", "failed"}:
+                    break
+                import time
+
+                time.sleep(1)
 
         def retry_selected(job_id):
             job_id = (job_id or "").strip()
             if not job_id:
-                return ("请输入任务 ID。", "", "", None, None, None)
+                return ("请输入任务 ID。", "", "", "", None, None, None, None, None, None)
             try:
                 job = manager.retry_job(job_id)
             except Exception as exc:
-                return (f"重试失败：{exc}", "", "", None, None, None)
+                return (f"重试失败：{exc}", "", "", "", None, None, None, None, None, None)
             if job is None:
-                return (f"任务不存在：{job_id}", "", "", None, None, None)
+                return (f"任务不存在：{job_id}", "", "", "", None, None, None, None, None, None)
             return inspect_job(job_id)
 
         def cancel_selected(job_id):
             job_id = (job_id or "").strip()
             if not job_id:
-                return ("请输入任务 ID。", "", "", None, None, None)
+                return ("请输入任务 ID。", "", "", "", None, None, None, None, None, None)
             job = manager.cancel_job(job_id)
             if job is None:
-                return (f"任务不存在：{job_id}", "", "", None, None, None)
+                return (f"任务不存在：{job_id}", "", "", "", None, None, None, None, None, None)
             return inspect_job(job_id)
 
         submit.click(
@@ -396,17 +560,66 @@ def build_ui(manager, gvhmr_manager=None):
         load_job.click(
             inspect_job,
             inputs=[selected_job],
-            outputs=[history_status, job_detail, history_logs, history_motion, history_video, history_zip],
+            outputs=[
+                history_status,
+                history_postprocess_status,
+                job_detail,
+                history_logs,
+                history_motion,
+                history_video,
+                history_optimized_motion,
+                history_optimized_video,
+                history_quality,
+                history_zip,
+            ],
+        )
+        postprocess_job.click(
+            request_postprocess_selected,
+            inputs=[selected_job, postprocess_profile, postprocess_pipeline, postprocess_render],
+            outputs=[
+                history_status,
+                history_postprocess_status,
+                job_detail,
+                history_logs,
+                history_motion,
+                history_video,
+                history_optimized_motion,
+                history_optimized_video,
+                history_quality,
+                history_zip,
+            ],
         )
         retry_job.click(
             retry_selected,
             inputs=[selected_job],
-            outputs=[history_status, job_detail, history_logs, history_motion, history_video, history_zip],
+            outputs=[
+                history_status,
+                history_postprocess_status,
+                job_detail,
+                history_logs,
+                history_motion,
+                history_video,
+                history_optimized_motion,
+                history_optimized_video,
+                history_quality,
+                history_zip,
+            ],
         )
         cancel_job.click(
             cancel_selected,
             inputs=[selected_job],
-            outputs=[history_status, job_detail, history_logs, history_motion, history_video, history_zip],
+            outputs=[
+                history_status,
+                history_postprocess_status,
+                job_detail,
+                history_logs,
+                history_motion,
+                history_video,
+                history_optimized_motion,
+                history_optimized_video,
+                history_quality,
+                history_zip,
+            ],
         )
 
     return app.queue()

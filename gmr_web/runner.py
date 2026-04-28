@@ -40,6 +40,17 @@ LOWER_BODY_SMOOTH_JOINTS = (
     "r_ankle_y_joint",
     "r_ankle_x_joint",
 )
+MAX_PROGRESS_LOGS = 10
+
+
+def progress_marks(total, max_logs=MAX_PROGRESS_LOGS):
+    total = int(total)
+    if total <= 0:
+        return set()
+    if total <= max_logs:
+        return set(range(1, total + 1))
+    span = total - 1
+    return {1 + round(idx * span / (max_logs - 1)) for idx in range(max_logs)}
 
 
 def estimate_ground_offset(retargeter: GMR, motion_frames):
@@ -133,7 +144,9 @@ def render_robot_motion(
     )
     try:
         total = len(root_pos)
+        render_progress_marks = progress_marks(total)
         for idx in range(total):
+            frame_no = idx + 1
             data.qpos[:3] = root_pos[idx]
             data.qpos[3:7] = root_rot_wxyz[idx]
             data.qpos[7:] = dof_pos[idx]
@@ -142,8 +155,8 @@ def render_robot_motion(
                 camera.lookat = data.xpos[base_body_id]
             renderer.update_scene(data, camera=camera)
             writer.append_data(renderer.render())
-            if logger and (idx == 0 or (idx + 1) % 100 == 0 or idx + 1 == total):
-                logger(f"[Render] {idx + 1}/{total}")
+            if logger and frame_no in render_progress_marks:
+                logger(f"[Render] {frame_no}/{total}")
     finally:
         writer.close()
         renderer.close()
@@ -181,14 +194,16 @@ def retarget_frames(
     prev_qpos = None
     qpos_list = []
     total = len(motion_frames)
+    retarget_progress_marks = progress_marks(total)
     for idx, frame in enumerate(motion_frames):
+        frame_no = idx + 1
         qpos = retargeter.retarget(frame)
         if apply_lower_body_smoothing:
             qpos = smooth_qpos(qpos, prev_qpos, qpos_indices, smoothing_alpha)
             prev_qpos = qpos.copy()
         qpos_list.append(qpos)
-        if idx == 0 or (idx + 1) % 100 == 0 or idx + 1 == total:
-            log(f"[GMR] Retarget {idx + 1}/{total}")
+        if frame_no in retarget_progress_marks:
+            log(f"[GMR] Retarget {frame_no}/{total}")
 
     save_motion_data(motion_path, make_motion_data(qpos_list, fps))
     return retargeter

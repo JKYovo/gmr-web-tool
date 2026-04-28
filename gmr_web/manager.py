@@ -1,4 +1,3 @@
-import shutil
 import threading
 from pathlib import Path
 from queue import Empty, Queue
@@ -20,6 +19,20 @@ from gmr_web.common import (
     zip_artifacts,
 )
 from gmr_web.runner import convert_bvh, convert_fbx_offline, convert_gvhmr_pt, convert_smplx_npz
+from tools.motion_postprocess import (
+    default_optimize_output,
+    default_optimize_quality_output,
+    default_video_output,
+    load_motion,
+    optimize_motion,
+    render_robot_motion,
+    save_motion,
+    write_report,
+)
+
+
+POSTPROCESS_PIPELINES = {"v2", "v2_foot"}
+POSTPROCESS_PROFILES = {"preview", "soft", "strict"}
 
 
 class JobManager:
@@ -85,7 +98,37 @@ class JobManager:
         }
         self.store.create_job(job)
         write_json(output_dir / "job.json", job)
-        self._queue.put(job_id)
+        self._queue.put(("convert", job_id))
+        return job
+
+    def request_postprocess(self, job_id, profile="soft", pipeline="v2_foot", render=True):
+        job = self.get_job(job_id)
+        if job is None:
+            return None
+        if job.get("status") != "succeeded":
+            raise RuntimeError("Only succeeded GMR jobs can be post-processed.")
+        if job.get("postprocess_status") in {"queued", "running"}:
+            raise RuntimeError("Postprocess is already queued or running for this job.")
+        if profile not in POSTPROCESS_PROFILES:
+            raise ValueError(f"Unsupported postprocess profile: {profile}")
+        if pipeline not in POSTPROCESS_PIPELINES:
+            raise ValueError(f"Unsupported postprocess pipeline: {pipeline}")
+
+        motion_path = Path(job.get("artifacts", {}).get("motion_path") or Path(job["output_dir"]) / "robot_motion.pkl")
+        if not motion_path.exists():
+            raise FileNotFoundError(f"robot_motion.pkl is required before postprocess: {motion_path}")
+
+        job["postprocess_status"] = "queued"
+        job["postprocess_profile"] = profile
+        job["postprocess_pipeline"] = pipeline
+        job["postprocess_render"] = bool(render)
+        job["postprocess_error"] = None
+        job["postprocess_started_at"] = None
+        job["postprocess_finished_at"] = None
+        job["postprocess_artifacts"] = {}
+        self._append_log(job, f"[Postprocess] Queued profile={profile}, pipeline={pipeline}, render={bool(render)}.")
+        self._save_job(job)
+        self._queue.put(("postprocess", job_id))
         return job
 
     def list_jobs(self, limit=50):
@@ -120,6 +163,10 @@ class JobManager:
             path = output_dir / name
             if path.exists():
                 path.unlink()
+        for pattern in ("motion_*.pkl", "preview_*.mp4", "quality_*.json"):
+            for path in output_dir.glob(pattern):
+                if path.exists():
+                    path.unlink()
         job["status"] = "queued"
         job["started_at"] = None
         job["finished_at"] = None
@@ -127,9 +174,20 @@ class JobManager:
         job["artifacts"] = {}
         job["error_summary"] = None
         job["cancel_requested"] = False
+        for key in (
+            "postprocess_status",
+            "postprocess_profile",
+            "postprocess_pipeline",
+            "postprocess_render",
+            "postprocess_error",
+            "postprocess_started_at",
+            "postprocess_finished_at",
+            "postprocess_artifacts",
+        ):
+            job.pop(key, None)
         self._append_log(job, "[Control] Retry requested.")
         self._save_job(job)
-        self._queue.put(job_id)
+        self._queue.put(("convert", job_id))
         return job
 
     def _append_log(self, job, message):
@@ -155,21 +213,43 @@ class JobManager:
 
     def _build_artifacts(self, job):
         output_dir = Path(job["output_dir"])
+        motion_path = output_dir / "robot_motion.pkl"
+        profile = job.get("postprocess_profile", "soft")
+        pipeline = job.get("postprocess_pipeline", "v2_foot")
         candidates = {
             "job_json_path": output_dir / "job.json",
-            "motion_path": output_dir / "robot_motion.pkl",
+            "motion_path": motion_path,
             "video_path": output_dir / "robot_preview.mp4",
+            "optimized_motion_path": default_optimize_output(motion_path, profile, pipeline),
+            "optimized_video_path": default_video_output(motion_path, profile, pipeline),
+            "quality_report_path": default_optimize_quality_output(motion_path, profile, pipeline),
             "artifacts_zip_path": output_dir / "artifacts.zip",
         }
         job["artifacts"] = {key: str(path) for key, path in candidates.items() if path.exists()}
+        postprocess_artifacts = {
+            key: job["artifacts"][key]
+            for key in ("optimized_motion_path", "optimized_video_path", "quality_report_path")
+            if key in job["artifacts"]
+        }
+        if postprocess_artifacts or job.get("postprocess_status"):
+            job["postprocess_artifacts"] = postprocess_artifacts
         return job["artifacts"]
 
-    def _finalize_success(self, job):
+    def _refresh_artifact_zip(self, job):
         output_dir = Path(job["output_dir"])
         artifacts = self._build_artifacts(job)
-        zip_path = zip_artifacts(output_dir, list(artifacts.values()))
+        artifact_values = [
+            path
+            for key, path in artifacts.items()
+            if key != "artifacts_zip_path" and Path(path).exists()
+        ]
+        zip_path = zip_artifacts(output_dir, artifact_values)
         artifacts["artifacts_zip_path"] = str(zip_path)
         job["artifacts"] = artifacts
+        return artifacts
+
+    def _finalize_success(self, job):
+        self._refresh_artifact_zip(job)
         job["status"] = "succeeded"
         job["finished_at"] = utc_now_iso()
         self._save_job(job)
@@ -218,39 +298,131 @@ class JobManager:
             raise ValueError(f"Unsupported source type: {job['source_type']}")
         job["artifacts"].update(artifacts)
 
+    def _run_postprocess(self, job):
+        output_dir = Path(job["output_dir"])
+        motion_path = Path(job.get("artifacts", {}).get("motion_path") or output_dir / "robot_motion.pkl")
+        profile = job.get("postprocess_profile", "soft")
+        pipeline = job.get("postprocess_pipeline", "v2_foot")
+        render = bool(job.get("postprocess_render", True))
+        output_path = default_optimize_output(motion_path, profile, pipeline)
+        quality_path = default_optimize_quality_output(motion_path, profile, pipeline)
+        video_path = default_video_output(motion_path, profile, pipeline)
+
+        if not motion_path.exists():
+            raise FileNotFoundError(f"robot_motion.pkl is required before postprocess: {motion_path}")
+        if motion_path == output_path:
+            raise ValueError("Refusing to overwrite robot_motion.pkl during postprocess.")
+
+        log = self._log_callback(job["job_id"])
+        log(f"[Postprocess] Loading {motion_path.name}.")
+        motion = load_motion(motion_path)
+        optimized, report = optimize_motion(
+            motion,
+            robot=job["robot"],
+            profile_name=profile,
+            pipeline_name=pipeline,
+        )
+        report["input"] = str(motion_path)
+        report["output"] = str(output_path)
+        save_motion(output_path, optimized)
+        write_report(quality_path, report)
+        log(f"[Postprocess] Saved {output_path.name} and {quality_path.name}.")
+
+        artifacts = {
+            "optimized_motion_path": str(output_path),
+            "quality_report_path": str(quality_path),
+        }
+        if render:
+            log("[Postprocess] Rendering optimized preview video.")
+            render_robot_motion(
+                output_path,
+                video_path,
+                robot=job["robot"],
+                logger=log,
+            )
+            artifacts["optimized_video_path"] = str(video_path)
+            log(f"[Postprocess] Saved {video_path.name}.")
+        elif video_path.exists():
+            video_path.unlink()
+        return artifacts
+
+    def _run_convert_queue_item(self, job_id):
+        job = self.get_job(job_id)
+        if job is None or job.get("cancel_requested"):
+            return
+
+        job["status"] = "running"
+        job["started_at"] = utc_now_iso()
+        self._append_log(job, "[GMR] Job started.")
+        self._save_job(job)
+        try:
+            self._run_job(job)
+            latest_job = self.get_job(job_id) or job
+            latest_job["artifacts"].update(job.get("artifacts", {}))
+            job = latest_job
+            if job.get("cancel_requested"):
+                job["status"] = "cancelled"
+                job["finished_at"] = utc_now_iso()
+                job["error_summary"] = "Cancelled after the current stage finished."
+                self._save_job(job)
+            else:
+                self._append_log(job, "[GMR] Job completed.")
+                self._finalize_success(job)
+        except Exception as exc:
+            job["status"] = "failed"
+            job["finished_at"] = utc_now_iso()
+            job["error_summary"] = str(exc)
+            self._append_log(job, f"[Error] {exc}")
+            self._save_job(job)
+
+    def _run_postprocess_queue_item(self, job_id):
+        job = self.get_job(job_id)
+        if job is None:
+            return
+        if job.get("status") != "succeeded":
+            job["postprocess_status"] = "failed"
+            job["postprocess_error"] = "Only succeeded GMR jobs can be post-processed."
+            self._append_log(job, f"[Postprocess] Failed: {job['postprocess_error']}")
+            self._save_job(job)
+            return
+
+        job["postprocess_status"] = "running"
+        job["postprocess_started_at"] = utc_now_iso()
+        job["postprocess_error"] = None
+        self._append_log(job, "[Postprocess] Started.")
+        self._save_job(job)
+        try:
+            artifacts = self._run_postprocess(job)
+            latest_job = self.get_job(job_id) or job
+            latest_job["postprocess_artifacts"] = artifacts
+            latest_job["postprocess_status"] = "succeeded"
+            latest_job["postprocess_finished_at"] = utc_now_iso()
+            latest_job["postprocess_error"] = None
+            latest_job["artifacts"].update(artifacts)
+            self._append_log(latest_job, "[Postprocess] Completed.")
+            self._refresh_artifact_zip(latest_job)
+            self._save_job(latest_job)
+        except Exception as exc:
+            job["postprocess_status"] = "failed"
+            job["postprocess_finished_at"] = utc_now_iso()
+            job["postprocess_error"] = str(exc)
+            self._append_log(job, f"[Postprocess] Failed: {exc}")
+            self._save_job(job)
+
     def _worker_loop(self):
         while not self._stop_event.is_set():
             try:
-                job_id = self._queue.get(timeout=0.5)
+                item = self._queue.get(timeout=0.5)
             except Empty:
                 continue
-            if job_id is None:
+            if item is None:
                 continue
+            if isinstance(item, tuple):
+                task_kind, job_id = item
+            else:
+                task_kind, job_id = "convert", item
 
-            job = self.get_job(job_id)
-            if job is None or job.get("cancel_requested"):
-                continue
-
-            job["status"] = "running"
-            job["started_at"] = utc_now_iso()
-            self._append_log(job, "[GMR] Job started.")
-            self._save_job(job)
-            try:
-                self._run_job(job)
-                latest_job = self.get_job(job_id) or job
-                latest_job["artifacts"].update(job.get("artifacts", {}))
-                job = latest_job
-                if job.get("cancel_requested"):
-                    job["status"] = "cancelled"
-                    job["finished_at"] = utc_now_iso()
-                    job["error_summary"] = "Cancelled after the current stage finished."
-                    self._save_job(job)
-                else:
-                    self._append_log(job, "[GMR] Job completed.")
-                    self._finalize_success(job)
-            except Exception as exc:
-                job["status"] = "failed"
-                job["finished_at"] = utc_now_iso()
-                job["error_summary"] = str(exc)
-                self._append_log(job, f"[Error] {exc}")
-                self._save_job(job)
+            if task_kind == "postprocess":
+                self._run_postprocess_queue_item(job_id)
+            else:
+                self._run_convert_queue_item(job_id)

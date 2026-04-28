@@ -24,6 +24,12 @@ class JobCreateRequest(BaseModel):
     display_name: str | None = None
 
 
+class JobPostprocessRequest(BaseModel):
+    profile: str = "soft"
+    pipeline: str = "v2_foot"
+    render: bool = True
+
+
 def create_components():
     ensure_dir(JOB_ROOT)
     store = SQLiteJobStore(DB_PATH)
@@ -85,6 +91,21 @@ def create_app():
             job = manager.retry_job(job_id)
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if job is None:
+            raise HTTPException(status_code=404, detail=f"Job not found: {job_id}")
+        return job
+
+    @app.post("/jobs/{job_id}/postprocess")
+    def postprocess_job(job_id: str, request: JobPostprocessRequest):
+        try:
+            job = manager.request_postprocess(
+                job_id,
+                profile=request.profile,
+                pipeline=request.pipeline,
+                render=request.render,
+            )
+        except (RuntimeError, FileNotFoundError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         if job is None:
             raise HTTPException(status_code=404, detail=f"Job not found: {job_id}")
         return job
