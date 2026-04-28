@@ -176,24 +176,24 @@ def build_parser() -> argparse.ArgumentParser:
     optimize.add_argument(
         "--pipeline",
         default="v2",
-        choices=["legacy", "v2"],
-        help="Optimization pipeline. legacy keeps the old full smoothing behavior; v2 focuses on arm jitter cleanup.",
+        choices=["legacy", "v2", "v2_foot"],
+        help="Optimization pipeline. legacy keeps the old full smoothing behavior; v2 focuses on arm jitter cleanup; v2_foot adds light foot-lock cleanup.",
     )
     optimize.add_argument(
         "--output",
         default=None,
-        help="Optimized pkl path. Defaults to robot_motion_<profile>_smooth.pkl next to input.",
+        help="Optimized pkl path. Defaults to robot_motion_<profile>_smooth.pkl; v2_foot defaults to robot_motion_<profile>_foot_smooth.pkl.",
     )
     optimize.add_argument(
         "--quality-json",
         default=None,
-        help="Quality JSON path. Defaults to motion_quality_<profile>.json next to input.",
+        help="Quality JSON path. Defaults to motion_quality_<profile>.json; v2_foot defaults to motion_quality_<profile>_foot.json.",
     )
     optimize.add_argument("--render", action="store_true", help="Render optimized mp4.")
     optimize.add_argument(
         "--video-output",
         default=None,
-        help="Rendered mp4 path. Defaults to robot_preview_<profile>_smooth.mp4 next to input.",
+        help="Rendered mp4 path. Defaults to robot_preview_<profile>_smooth.mp4; v2_foot defaults to robot_preview_<profile>_foot_smooth.mp4.",
     )
     optimize.add_argument("--width", type=int, default=640)
     optimize.add_argument("--height", type=int, default=480)
@@ -531,6 +531,8 @@ def optimize_motion(
         return optimize_motion_legacy(motion, robot=robot, profile_name=profile_name)
     if pipeline_name == "v2":
         return optimize_motion_v2(motion, robot=robot, profile_name=profile_name)
+    if pipeline_name == "v2_foot":
+        return optimize_motion_v2_foot(motion, robot=robot, profile_name=profile_name)
     raise ValueError(f"Unsupported pipeline: {pipeline_name}")
 
 
@@ -683,6 +685,63 @@ def optimize_motion_v2(
         optimizer_version="v2_arm_spike",
         repair=repair,
     )
+    return optimized, report
+
+
+def optimize_motion_v2_foot(
+    motion: dict[str, Any],
+    *,
+    robot: str,
+    profile_name: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    v2_motion, v2_report = optimize_motion_v2(motion, robot=robot, profile_name=profile_name)
+
+    profile = PROFILES[profile_name]
+    model = load_robot_model(robot)
+    fps, root_pos, root_rot, dof_pos = parse_motion_arrays(motion)
+    joints = get_joint_info(model, dof_pos.shape[1], profile)
+    _, v2_root_pos, v2_root_rot, v2_dof_pos = parse_motion_arrays(v2_motion)
+
+    corrected_root_pos, foot_contact, foot_lock = apply_light_foot_lock(
+        model,
+        v2_root_pos,
+        v2_root_rot,
+        v2_dof_pos,
+        fps,
+    )
+
+    optimized = dict(v2_motion)
+    optimized["root_pos"] = corrected_root_pos.astype(
+        np.asarray(v2_motion["root_pos"]).dtype, copy=False
+    )
+
+    after = quality_metrics(corrected_root_pos, v2_root_rot, v2_dof_pos, fps, joints, model)
+    repair = {
+        **v2_report.get("repair", {}),
+        "foot_lock_available": bool(foot_lock.get("available", False)),
+        "foot_lock_corrected_frames": int(foot_lock.get("corrected_frames", 0)),
+    }
+    report = build_report(
+        robot=robot,
+        profile_name=profile_name,
+        fps=fps,
+        root_pos=root_pos,
+        root_rot=root_rot,
+        dof_pos=dof_pos,
+        optimized_root_pos=corrected_root_pos,
+        optimized_root_rot=v2_root_rot,
+        optimized_dof_pos=v2_dof_pos,
+        joints=joints,
+        before=v2_report["before"],
+        after=after,
+        clipped_values=int(v2_report.get("clipped_values", 0)),
+        ground_z_shift=float(v2_report.get("ground_z_shift", 0.0)),
+        pipeline_name="v2_foot",
+        optimizer_version="v3_light_foot_lock",
+        repair=repair,
+    )
+    report["foot_contact"] = foot_contact
+    report["foot_lock"] = foot_lock
     return optimized, report
 
 
@@ -878,6 +937,42 @@ def top_joint_metric(per_joint: dict[str, dict[str, Any]], metric: str) -> list[
     return [{"joint": name, metric: value} for name, value in items]
 
 
+def mask_to_segments(mask: np.ndarray) -> list[tuple[int, int]]:
+    indices = np.flatnonzero(mask)
+    if len(indices) == 0:
+        return []
+    segments: list[tuple[int, int]] = []
+    start = int(indices[0])
+    previous = start
+    for index in indices[1:]:
+        index = int(index)
+        if index == previous + 1:
+            previous = index
+            continue
+        segments.append((start, previous))
+        start = previous = index
+    segments.append((start, previous))
+    return segments
+
+
+def close_boolean_gaps(mask: np.ndarray, max_gap: int) -> np.ndarray:
+    result = np.asarray(mask, dtype=bool).copy()
+    segments = mask_to_segments(result)
+    for (_, previous_end), (next_start, _) in zip(segments, segments[1:]):
+        gap = next_start - previous_end - 1
+        if 0 < gap <= max_gap:
+            result[previous_end + 1 : next_start] = True
+    return result
+
+
+def remove_short_segments(mask: np.ndarray, min_length: int) -> np.ndarray:
+    result = np.asarray(mask, dtype=bool).copy()
+    for start, end in mask_to_segments(result):
+        if end - start + 1 < min_length:
+            result[start : end + 1] = False
+    return result
+
+
 def find_foot_body_ids(model: mj.MjModel) -> list[int]:
     ids = []
     for body_id in range(model.nbody):
@@ -887,6 +982,251 @@ def find_foot_body_ids(model: mj.MjModel) -> list[int]:
     return ids
 
 
+def find_foot_geom_ids(model: mj.MjModel) -> dict[str, list[int]]:
+    foot_geoms = {"left": [], "right": []}
+    for geom_id in range(model.ngeom):
+        name = mj.mj_id2name(model, mj.mjtObj.mjOBJ_GEOM, geom_id)
+        if not name:
+            continue
+        lower = name.lower()
+        if not ("foot" in lower and "collision" in lower):
+            continue
+        if lower.startswith("l_"):
+            foot_geoms["left"].append(geom_id)
+        elif lower.startswith("r_"):
+            foot_geoms["right"].append(geom_id)
+    return {side: ids for side, ids in foot_geoms.items() if ids}
+
+
+def replay_foot_geom_tracks(
+    model: mj.MjModel,
+    root_pos: np.ndarray,
+    root_rot_xyzw: np.ndarray,
+    dof_pos: np.ndarray,
+) -> tuple[dict[str, np.ndarray], dict[str, list[str]]]:
+    # 用 MuJoCo 正运动学重放动作，直接读取 XML 里 foot collision geom 的世界坐标。
+    # 这比用 ankle body 近似脚底更接近真实接触点，也更适合判断脚滑。
+    foot_geom_ids = find_foot_geom_ids(model)
+    if not foot_geom_ids:
+        return {}, {}
+
+    data = mj.MjData(model)
+    root_rot_wxyz = root_rot_xyzw[:, [3, 0, 1, 2]]
+    tracks = {
+        side: np.zeros((len(root_pos), len(ids), 3), dtype=np.float64)
+        for side, ids in foot_geom_ids.items()
+    }
+    names = {
+        side: [mj.mj_id2name(model, mj.mjtObj.mjOBJ_GEOM, geom_id) or str(geom_id) for geom_id in ids]
+        for side, ids in foot_geom_ids.items()
+    }
+
+    for frame_idx in range(len(root_pos)):
+        data.qpos[:3] = root_pos[frame_idx]
+        data.qpos[3:7] = root_rot_wxyz[frame_idx]
+        data.qpos[7:] = dof_pos[frame_idx]
+        mj.mj_forward(model, data)
+        for side, ids in foot_geom_ids.items():
+            for local_idx, geom_id in enumerate(ids):
+                tracks[side][frame_idx, local_idx] = data.geom_xpos[geom_id]
+    return tracks, names
+
+
+def foot_representative_track(positions: np.ndarray) -> np.ndarray:
+    # 多个 foot collision capsule 属于同一只脚。XY 用平均位置更抗噪，
+    # Z 用最低点更接近“有没有贴近地面”。
+    xy = np.mean(positions[:, :, :2], axis=1)
+    z = np.min(positions[:, :, 2], axis=1)
+    return np.column_stack([xy, z])
+
+
+def build_foot_contact_masks(
+    tracks: dict[str, np.ndarray],
+    fps: int,
+) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
+    # 接触检测不是物理仿真，只是一个轻量启发式：
+    # 脚够低、竖直速度不大、水平速度不过分离谱时，认为它可能是支撑脚。
+    # 后面会合并很短的断点，避免一个支撑段被噪声切成很多碎片。
+    masks: dict[str, np.ndarray] = {}
+    side_stats: dict[str, Any] = {}
+    max_gap = max(1, int(round(0.06 * fps)))
+    min_segment = max(3, int(round(0.10 * fps)))
+
+    for side, positions in tracks.items():
+        representative = foot_representative_track(positions)
+        z = representative[:, 2]
+        xy_speed = (
+            np.linalg.norm(np.diff(representative[:, :2], axis=0), axis=1) * fps
+            if len(representative) > 1
+            else np.zeros((0,), dtype=np.float64)
+        )
+        z_speed = (
+            np.abs(np.diff(z, prepend=z[0])) * fps
+            if len(z)
+            else np.zeros((0,), dtype=np.float64)
+        )
+        xy_speed_full = np.concatenate([[0.0], xy_speed]) if xy_speed.size else np.zeros_like(z)
+        height_threshold = percentile(z, 8) + 0.035
+        raw_mask = (z <= height_threshold) & (z_speed <= 1.0) & (xy_speed_full <= 3.0)
+        contact_mask = remove_short_segments(close_boolean_gaps(raw_mask, max_gap), min_segment)
+        masks[side] = contact_mask
+        side_stats[side] = {
+            "contact_frames": int(np.count_nonzero(contact_mask)),
+            "contact_segments": int(len(mask_to_segments(contact_mask))),
+            "height_threshold": float(height_threshold),
+            "min_height": min_value(z),
+            "xy_speed_p95_when_contact": (
+                percentile(xy_speed[contact_mask[:-1]], 95)
+                if xy_speed.size and np.any(contact_mask[:-1])
+                else 0.0
+            ),
+        }
+    return masks, side_stats
+
+
+def summarize_foot_geom_contact(
+    tracks: dict[str, np.ndarray],
+    names: dict[str, list[str]],
+    fps: int,
+) -> dict[str, Any]:
+    masks, side_stats = build_foot_contact_masks(tracks, fps)
+    sliding_values = []
+    per_frame_lowest = []
+    min_height = float("inf")
+    for side, positions in tracks.items():
+        representative = foot_representative_track(positions)
+        min_height = min(min_height, min_value(representative[:, 2]))
+        per_frame_lowest.append(representative[:, 2])
+        if len(representative) > 1 and np.any(masks[side][:-1]):
+            xy_speed = np.linalg.norm(np.diff(representative[:, :2], axis=0), axis=1) * fps
+            sliding_values.append(xy_speed[masks[side][:-1]])
+
+    all_sliding = np.concatenate(sliding_values) if sliding_values else np.zeros((0,), dtype=np.float64)
+    lowest = np.min(np.column_stack(per_frame_lowest), axis=1) if per_frame_lowest else np.zeros((0,))
+    if not np.isfinite(min_height):
+        min_height = 0.0
+    return {
+        "available": True,
+        "source": "foot_collision_geoms",
+        "foot_geoms": names,
+        "min_foot_height": float(min_height),
+        "estimated_ground_penetration_depth": max(0.0, -float(min_height)),
+        "lowest_foot_height_p05": percentile(lowest, 5),
+        "estimated_foot_sliding_speed": summarize_array(all_sliding),
+        "side_metrics": side_stats,
+    }
+
+
+def clip_vector_norm(vectors: np.ndarray, max_norm: float) -> np.ndarray:
+    result = np.asarray(vectors, dtype=np.float64).copy()
+    norm = np.linalg.norm(result, axis=1)
+    too_large = norm > max_norm
+    if np.any(too_large):
+        result[too_large] *= (max_norm / np.maximum(norm[too_large], 1e-8))[:, None]
+    return result
+
+
+def edge_taper(length: int, ramp: int) -> np.ndarray:
+    if length <= 0:
+        return np.zeros((0,), dtype=np.float64)
+    ramp = max(1, min(int(ramp), max(1, length // 2)))
+    weights = np.ones((length,), dtype=np.float64)
+    weights[:ramp] = np.linspace(0.0, 1.0, ramp, endpoint=True)
+    weights[-ramp:] = np.minimum(weights[-ramp:], np.linspace(1.0, 0.0, ramp, endpoint=True))
+    return weights
+
+
+def limit_vector_step(values: np.ndarray, max_step: float) -> np.ndarray:
+    result = np.asarray(values, dtype=np.float64).copy()
+    for idx in range(1, len(result)):
+        delta = result[idx] - result[idx - 1]
+        norm = float(np.linalg.norm(delta))
+        if norm > max_step:
+            result[idx] = result[idx - 1] + delta / max(norm, 1e-8) * max_step
+    return result
+
+
+def apply_light_foot_lock(
+    model: mj.MjModel,
+    root_pos: np.ndarray,
+    root_rot_xyzw: np.ndarray,
+    dof_pos: np.ndarray,
+    fps: int,
+) -> tuple[np.ndarray, dict[str, Any], dict[str, Any]]:
+    # Foot-lock 的核心思路：
+    # 1. 找到支撑脚接触段；
+    # 2. 用接触段内脚底 XY 的中位数作为“应该钉住”的支撑位置；
+    # 3. 如果后续脚底在地上滑，就反向微调 root XY 抵消漂移。
+    # 注意这里不改 dof_pos，不改 root Z，因此不会破坏 V2 的手臂平滑结果。
+    foot_tracks, foot_names = replay_foot_geom_tracks(model, root_pos, root_rot_xyzw, dof_pos)
+    if not foot_tracks:
+        return (
+            root_pos.copy(),
+            {"available": False, "reason": "No foot collision geoms found."},
+            {"available": False, "reason": "No foot collision geoms found."},
+        )
+
+    contact_masks, contact_side_stats = build_foot_contact_masks(foot_tracks, fps)
+    correction_sum = np.zeros((len(root_pos), 2), dtype=np.float64)
+    correction_weight = np.zeros((len(root_pos),), dtype=np.float64)
+
+    strength = 1.0
+    max_segment_correction = 0.08
+    max_step = 0.006
+    smooth_window = max(3, int(round(0.08 * fps)))
+    ramp_frames = max(2, int(round(0.05 * fps)))
+    total_segments = 0
+    skipped_segments = 0
+
+    for side, positions in foot_tracks.items():
+        representative = foot_representative_track(positions)
+        for start, end in mask_to_segments(contact_masks[side]):
+            length = end - start + 1
+            if length < max(3, int(round(0.10 * fps))):
+                skipped_segments += 1
+                continue
+            total_segments += 1
+            # 如果只取接触段开头做锚点，开头刚好有噪声时会把整段都带偏。
+            # 这里优先用整段脚底 XY 的中位数做“支撑点”，比均值更不怕偶发跳点。
+            anchor_xy = np.median(representative[start : end + 1, :2], axis=0)
+            raw_correction = anchor_xy[None, :] - representative[start : end + 1, :2]
+            raw_correction = clip_vector_norm(raw_correction, max_segment_correction)
+            raw_correction = centered_smooth(raw_correction, smooth_window)
+            taper = edge_taper(length, ramp_frames)
+            correction = raw_correction * taper[:, None] * strength
+            correction_sum[start : end + 1] += correction
+            correction_weight[start : end + 1] += 1.0
+
+    combined = np.zeros_like(correction_sum)
+    active = correction_weight > 0
+    combined[active] = correction_sum[active] / correction_weight[active, None]
+    combined = centered_smooth(combined, smooth_window)
+    combined = limit_vector_step(combined, max_step)
+
+    corrected_root_pos = root_pos.copy()
+    corrected_root_pos[:, :2] += combined
+    correction_norm = np.linalg.norm(combined, axis=1)
+    contact_info = {
+        "available": True,
+        "source": "foot_collision_geoms",
+        "foot_geoms": foot_names,
+        "sides": contact_side_stats,
+    }
+    foot_lock_info = {
+        "available": True,
+        "strength": strength,
+        "max_segment_correction_m": max_segment_correction,
+        "max_step_m_per_frame": max_step,
+        "corrected_frames": int(np.count_nonzero(correction_norm > 1e-6)),
+        "contact_segments_used": int(total_segments),
+        "contact_segments_skipped": int(skipped_segments),
+        "mean_root_xy_correction_m": float(np.mean(correction_norm)),
+        "max_root_xy_correction_m": max_value(correction_norm),
+        "p95_root_xy_correction_m": percentile(correction_norm, 95),
+    }
+    return corrected_root_pos, contact_info, foot_lock_info
+
+
 def contact_metrics(
     root_pos: np.ndarray,
     root_rot_xyzw: np.ndarray,
@@ -894,6 +1234,10 @@ def contact_metrics(
     fps: int,
     model: mj.MjModel,
 ) -> dict[str, Any]:
+    foot_tracks, foot_names = replay_foot_geom_tracks(model, root_pos, root_rot_xyzw, dof_pos)
+    if foot_tracks:
+        return summarize_foot_geom_contact(foot_tracks, foot_names, fps)
+
     foot_body_ids = find_foot_body_ids(model)
     if not foot_body_ids:
         return {"available": False, "reason": "No foot/toe/sole/ankle body found in MuJoCo model."}
@@ -985,16 +1329,20 @@ def default_quality_output(input_path: Path) -> Path:
     return input_path.with_name("motion_quality.json")
 
 
-def default_optimize_output(input_path: Path, profile: str) -> Path:
-    return input_path.with_name(f"robot_motion_{profile}_smooth.pkl")
+def output_profile_label(profile: str, pipeline: str) -> str:
+    return f"{profile}_foot" if pipeline == "v2_foot" else profile
 
 
-def default_optimize_quality_output(input_path: Path, profile: str) -> Path:
-    return input_path.with_name(f"motion_quality_{profile}.json")
+def default_optimize_output(input_path: Path, profile: str, pipeline: str) -> Path:
+    return input_path.with_name(f"robot_motion_{output_profile_label(profile, pipeline)}_smooth.pkl")
 
 
-def default_video_output(input_path: Path, profile: str) -> Path:
-    return input_path.with_name(f"robot_preview_{profile}_smooth.mp4")
+def default_optimize_quality_output(input_path: Path, profile: str, pipeline: str) -> Path:
+    return input_path.with_name(f"motion_quality_{output_profile_label(profile, pipeline)}.json")
+
+
+def default_video_output(input_path: Path, profile: str, pipeline: str) -> Path:
+    return input_path.with_name(f"robot_preview_{output_profile_label(profile, pipeline)}_smooth.mp4")
 
 
 def run_quality(args: argparse.Namespace) -> None:
@@ -1019,17 +1367,17 @@ def run_optimize(args: argparse.Namespace) -> None:
     output_path = (
         Path(args.output).expanduser().resolve()
         if args.output
-        else default_optimize_output(input_path, args.profile)
+        else default_optimize_output(input_path, args.profile, args.pipeline)
     )
     quality_path = (
         Path(args.quality_json).expanduser().resolve()
         if args.quality_json
-        else default_optimize_quality_output(input_path, args.profile)
+        else default_optimize_quality_output(input_path, args.profile, args.pipeline)
     )
     video_path = (
         Path(args.video_output).expanduser().resolve()
         if args.video_output
-        else default_video_output(input_path, args.profile)
+        else default_video_output(input_path, args.profile, args.pipeline)
     )
 
     if input_path == output_path:
