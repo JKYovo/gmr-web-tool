@@ -9,6 +9,14 @@ import sys
 from pathlib import Path
 
 
+def output_name_label(profile: str, pipeline: str) -> str:
+    if pipeline == "v2_foot":
+        return "foot" if profile == "soft" else f"{profile}_foot"
+    if pipeline == "legacy":
+        return f"{profile}_legacy"
+    return profile
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Compatibility wrapper. Prefer GMR/tools/motion_postprocess.py optimize."
@@ -28,8 +36,9 @@ def main() -> None:
     # 保留旧脚本的命令行参数形式，实际处理逻辑统一交给新的通用后处理工具。
     tool = Path(__file__).with_name("motion_postprocess.py")
     output_path = Path(args.output).expanduser()
-    quality_json = args.quality_json or str(output_path.with_name("motion_quality.json"))
-    video_output = args.video_output or str(output_path.with_name("robot_preview_smooth.mp4"))
+    label = output_name_label(args.profile, args.pipeline)
+    quality_json = args.quality_json or str(output_path.with_name(f"quality_{label}.json"))
+    video_output = args.video_output or str(output_path.with_name(f"preview_{label}.mp4"))
     cmd = [
         sys.executable,
         str(tool),

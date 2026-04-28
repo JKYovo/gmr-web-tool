@@ -182,18 +182,18 @@ def build_parser() -> argparse.ArgumentParser:
     optimize.add_argument(
         "--output",
         default=None,
-        help="Optimized pkl path. Defaults to robot_motion_<profile>_smooth.pkl; v2_foot defaults to robot_motion_<profile>_foot_smooth.pkl.",
+        help="Optimized pkl path. Defaults to short names such as motion_soft.pkl or motion_foot.pkl.",
     )
     optimize.add_argument(
         "--quality-json",
         default=None,
-        help="Quality JSON path. Defaults to motion_quality_<profile>.json; v2_foot defaults to motion_quality_<profile>_foot.json.",
+        help="Quality JSON path. Defaults to short names such as quality_soft.json or quality_foot.json.",
     )
     optimize.add_argument("--render", action="store_true", help="Render optimized mp4.")
     optimize.add_argument(
         "--video-output",
         default=None,
-        help="Rendered mp4 path. Defaults to robot_preview_<profile>_smooth.mp4; v2_foot defaults to robot_preview_<profile>_foot_smooth.mp4.",
+        help="Rendered mp4 path. Defaults to short names such as preview_soft.mp4 or preview_foot.mp4.",
     )
     optimize.add_argument("--width", type=int, default=640)
     optimize.add_argument("--height", type=int, default=480)
@@ -1329,20 +1329,26 @@ def default_quality_output(input_path: Path) -> Path:
     return input_path.with_name("motion_quality.json")
 
 
-def output_profile_label(profile: str, pipeline: str) -> str:
-    return f"{profile}_foot" if pipeline == "v2_foot" else profile
+def output_name_label(profile: str, pipeline: str) -> str:
+    # 目录本身已经区分任务，文件名就尽量短一点。
+    # 当前推荐组合 soft + v2_foot 直接叫 foot，避免 robot_motion_soft_foot_smooth 这种长串。
+    if pipeline == "v2_foot":
+        return "foot" if profile == "soft" else f"{profile}_foot"
+    if pipeline == "legacy":
+        return f"{profile}_legacy"
+    return profile
 
 
 def default_optimize_output(input_path: Path, profile: str, pipeline: str) -> Path:
-    return input_path.with_name(f"robot_motion_{output_profile_label(profile, pipeline)}_smooth.pkl")
+    return input_path.with_name(f"motion_{output_name_label(profile, pipeline)}.pkl")
 
 
 def default_optimize_quality_output(input_path: Path, profile: str, pipeline: str) -> Path:
-    return input_path.with_name(f"motion_quality_{output_profile_label(profile, pipeline)}.json")
+    return input_path.with_name(f"quality_{output_name_label(profile, pipeline)}.json")
 
 
 def default_video_output(input_path: Path, profile: str, pipeline: str) -> Path:
-    return input_path.with_name(f"robot_preview_{output_profile_label(profile, pipeline)}_smooth.mp4")
+    return input_path.with_name(f"preview_{output_name_label(profile, pipeline)}.mp4")
 
 
 def run_quality(args: argparse.Namespace) -> None:
