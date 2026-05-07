@@ -44,7 +44,8 @@ class JobManager:
         self._thread = None
 
     def start(self):
-        if self._thread is None:
+        if self._thread is None or not self._thread.is_alive():
+            self._stop_event.clear()
             self._thread = threading.Thread(target=self._worker_loop, daemon=True, name="gmr-web-worker")
             self._thread.start()
 
@@ -98,6 +99,7 @@ class JobManager:
         }
         self.store.create_job(job)
         write_json(output_dir / "job.json", job)
+        self.start()
         self._queue.put(("convert", job_id))
         return job
 
@@ -128,6 +130,7 @@ class JobManager:
         job["postprocess_artifacts"] = {}
         self._append_log(job, f"[Postprocess] Queued profile={profile}, pipeline={pipeline}, render={bool(render)}.")
         self._save_job(job)
+        self.start()
         self._queue.put(("postprocess", job_id))
         return job
 
@@ -187,6 +190,7 @@ class JobManager:
             job.pop(key, None)
         self._append_log(job, "[Control] Retry requested.")
         self._save_job(job)
+        self.start()
         self._queue.put(("convert", job_id))
         return job
 
@@ -198,7 +202,8 @@ class JobManager:
         job["updated_at"] = utc_now_iso()
         self._build_artifacts(job)
         self.store.save_job(job)
-        write_json(Path(job["output_dir"]) / "job.json", job)
+        output_dir = ensure_dir(Path(job["output_dir"]))
+        write_json(output_dir / "job.json", job)
 
     def _log_callback(self, job_id):
         def callback(message):
@@ -207,7 +212,8 @@ class JobManager:
                 return
             self._append_log(job, message)
             self.store.save_job(job)
-            write_json(Path(job["output_dir"]) / "job.json", job)
+            output_dir = ensure_dir(Path(job["output_dir"]))
+            write_json(output_dir / "job.json", job)
 
         return callback
 
@@ -422,7 +428,29 @@ class JobManager:
             else:
                 task_kind, job_id = "convert", item
 
-            if task_kind == "postprocess":
-                self._run_postprocess_queue_item(job_id)
-            else:
-                self._run_convert_queue_item(job_id)
+            try:
+                if task_kind == "postprocess":
+                    self._run_postprocess_queue_item(job_id)
+                else:
+                    self._run_convert_queue_item(job_id)
+            except Exception as exc:
+                self._mark_worker_error(task_kind, job_id, exc)
+
+    def _mark_worker_error(self, task_kind, job_id, exc):
+        job = self.get_job(job_id)
+        if job is None:
+            return
+        if task_kind == "postprocess":
+            job["postprocess_status"] = "failed"
+            job["postprocess_finished_at"] = utc_now_iso()
+            job["postprocess_error"] = str(exc)
+            self._append_log(job, f"[Worker] Unhandled postprocess error: {exc}")
+        else:
+            job["status"] = "failed"
+            job["finished_at"] = utc_now_iso()
+            job["error_summary"] = str(exc)
+            self._append_log(job, f"[Worker] Unhandled GMR error: {exc}")
+        try:
+            self._save_job(job)
+        except Exception:
+            self.store.save_job(job)

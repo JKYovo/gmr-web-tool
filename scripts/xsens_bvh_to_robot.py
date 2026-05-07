@@ -175,6 +175,38 @@ if __name__ == "__main__":
         help="EMA factor for root/lower-body temporal smoothing. Set to 1.0 to disable.",
     )
 
+    parser.add_argument(
+        "--show_com_projection",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Show robot center of mass and its ground projection in the MuJoCo viewer.",
+    )
+
+    parser.add_argument(
+        "--show_support_polygon",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Show estimated support foot area/polygon in the MuJoCo viewer.",
+    )
+
+    parser.add_argument(
+        "--free_camera",
+        action="store_true",
+        default=False,
+        help="Shortcut for --camera_mode free.",
+    )
+
+    parser.add_argument(
+        "--camera_mode",
+        choices=["track", "fixed", "free"],
+        default="track",
+        help=(
+            "Viewer camera behavior: track keeps the look-at point on the robot "
+            "but lets the mouse control rotation/zoom; fixed also resets distance "
+            "and elevation every frame; free never updates the camera."
+        ),
+    )
+
     args = parser.parse_args()
 
     if args.save_path is not None:
@@ -255,6 +287,9 @@ if __name__ == "__main__":
             dof_pos=qpos[7:],
             human_motion_data=retargeter.scaled_human_data,
             rate_limit=args.rate_limit,
+            camera_mode="free" if args.free_camera else args.camera_mode,
+            show_com_projection=args.show_com_projection,
+            show_support_polygon=args.show_support_polygon,
             # human_pos_offset=np.array([0.0, 0.0, 0.0])
         )
 

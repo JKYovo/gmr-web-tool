@@ -42,6 +42,116 @@ def draw_frame(
         )
         v.user_scn.ngeom += 1
 
+
+def add_marker(viewer, pos, size, rgba, label=None):
+    if viewer.user_scn.ngeom >= viewer.user_scn.maxgeom:
+        return
+    geom = viewer.user_scn.geoms[viewer.user_scn.ngeom]
+    mj.mjv_initGeom(
+        geom,
+        type=mj.mjtGeom.mjGEOM_SPHERE,
+        size=size,
+        pos=pos,
+        mat=np.eye(3).flatten(),
+        rgba=rgba,
+    )
+    if label is not None:
+        geom.label = label
+    viewer.user_scn.ngeom += 1
+
+
+def add_line(viewer, start, end, width, rgba):
+    if viewer.user_scn.ngeom >= viewer.user_scn.maxgeom:
+        return
+    geom = viewer.user_scn.geoms[viewer.user_scn.ngeom]
+    mj.mjv_initGeom(
+        geom,
+        type=mj.mjtGeom.mjGEOM_CAPSULE,
+        size=[width, 0.0, 0.0],
+        pos=np.zeros(3),
+        mat=np.eye(3).flatten(),
+        rgba=rgba,
+    )
+    mj.mjv_connector(
+        geom,
+        type=mj.mjtGeom.mjGEOM_CAPSULE,
+        width=width,
+        from_=start,
+        to=end,
+    )
+    viewer.user_scn.ngeom += 1
+
+
+def add_box(viewer, pos, mat, size, rgba, label=None):
+    if viewer.user_scn.ngeom >= viewer.user_scn.maxgeom:
+        return
+    geom = viewer.user_scn.geoms[viewer.user_scn.ngeom]
+    mj.mjv_initGeom(
+        geom,
+        type=mj.mjtGeom.mjGEOM_BOX,
+        size=size,
+        pos=pos,
+        mat=mat.flatten(),
+        rgba=rgba,
+    )
+    if label is not None:
+        geom.label = label
+    viewer.user_scn.ngeom += 1
+
+
+def convex_hull_xy(points):
+    points = sorted(set((float(point[0]), float(point[1])) for point in points))
+    if len(points) <= 1:
+        return np.asarray(points)
+
+    def cross(origin, a, b):
+        return (
+            (a[0] - origin[0]) * (b[1] - origin[1])
+            - (a[1] - origin[1]) * (b[0] - origin[0])
+        )
+
+    lower = []
+    for point in points:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], point) <= 0:
+            lower.pop()
+        lower.append(point)
+
+    upper = []
+    for point in reversed(points):
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], point) <= 0:
+            upper.pop()
+        upper.append(point)
+
+    return np.asarray(lower[:-1] + upper[:-1], dtype=float)
+
+
+def ground_yaw_rotation(body_mat):
+    x_axis = body_mat[:, 0].copy()
+    x_axis[2] = 0.0
+    norm = np.linalg.norm(x_axis)
+    if norm < 1e-6:
+        return np.eye(3)
+    x_axis /= norm
+    z_axis = np.array([0.0, 0.0, 1.0])
+    y_axis = np.cross(z_axis, x_axis)
+    y_axis /= np.linalg.norm(y_axis)
+    return np.column_stack([x_axis, y_axis, z_axis])
+
+
+def support_foot_corners(center, yaw_mat, half_length, half_width, z=0.003):
+    local_corners = np.array(
+        [
+            [half_length, half_width, 0.0],
+            [half_length, -half_width, 0.0],
+            [-half_length, -half_width, 0.0],
+            [-half_length, half_width, 0.0],
+        ]
+    )
+    corners = center + local_corners @ yaw_mat.T
+    corners[:, 2] = z
+    return corners
+
+
 class RobotMotionViewer:
     def __init__(self,
                 robot_type,
@@ -111,7 +221,10 @@ class RobotMotionViewer:
             human_pos_offset=np.array([0.0, 0.0, 0]),
             # rate limit
             rate_limit=True, 
-            follow_camera=True,
+            follow_camera=None,
+            camera_mode="fixed",
+            show_com_projection=False,
+            show_support_polygon=False,
             ):
         """
         by default visualize robot motion.
@@ -128,16 +241,98 @@ class RobotMotionViewer:
         self.data.qpos[7:] = dof_pos
         
         mj.mj_forward(self.model, self.data)
+
+        if follow_camera is not None:
+            camera_mode = "fixed" if follow_camera else "free"
         
-        if follow_camera:
+        if camera_mode in ("fixed", "track"):
             self.viewer.cam.lookat = self.data.xpos[self.model.body(self.robot_base).id]
+        if camera_mode == "fixed":
             self.viewer.cam.distance = self.viewer_cam_distance
             self.viewer.cam.elevation = -10  # 正面视角，轻微向下看
             # self.viewer.cam.azimuth = 180    # 正面朝向机器人
         
+        # Clean custom geometry.
+        self.viewer.user_scn.ngeom = 0
+
+        if show_com_projection:
+            total_mass = np.sum(self.model.body_mass)
+            if total_mass > 0.0:
+                com = np.sum(self.data.xipos * self.model.body_mass[:, None], axis=0) / total_mass
+                com_projection = com.copy()
+                com_projection[2] = 0.0
+                add_line(
+                    self.viewer,
+                    com_projection,
+                    com,
+                    width=0.006,
+                    rgba=np.array([1.0, 0.85, 0.0, 0.75]),
+                )
+                add_marker(
+                    self.viewer,
+                    com,
+                    size=np.array([0.025, 0.025, 0.025]),
+                    rgba=np.array([1.0, 0.1, 0.1, 1.0]),
+                )
+                add_marker(
+                    self.viewer,
+                    com_projection,
+                    size=np.array([0.035, 0.035, 0.006]),
+                    rgba=np.array([1.0, 0.85, 0.0, 1.0]),
+                )
+
+        if show_support_polygon:
+            support_corners = []
+            foot_specs = (
+                ("l_ankle_x_link", "lf_tc"),
+                ("r_ankle_x_link", "rf_tc"),
+            )
+            for foot_body_name, foot_site_name in foot_specs:
+                body_id = mj.mj_name2id(self.model, mj.mjtObj.mjOBJ_BODY, foot_body_name)
+                site_id = mj.mj_name2id(self.model, mj.mjtObj.mjOBJ_SITE, foot_site_name)
+                if body_id < 0 or site_id < 0:
+                    continue
+                site_pos = self.data.site_xpos[site_id]
+                if site_pos[2] > 0.08:
+                    continue
+                yaw_mat = ground_yaw_rotation(self.data.xmat[body_id].reshape(3, 3))
+                center = self.data.xpos[body_id].copy()
+                center[2] = 0.004
+                half_length = 0.11
+                half_width = 0.04
+                add_box(
+                    self.viewer,
+                    center,
+                    yaw_mat,
+                    size=np.array([half_length, half_width, 0.003]),
+                    rgba=np.array([0.0, 0.55, 1.0, 0.22]),
+                )
+                corners = support_foot_corners(center, yaw_mat, half_length, half_width)
+                support_corners.extend(corners)
+                for start, end in zip(corners, np.roll(corners, -1, axis=0)):
+                    add_line(
+                        self.viewer,
+                        start,
+                        end,
+                        width=0.004,
+                        rgba=np.array([0.0, 0.65, 1.0, 0.9]),
+                    )
+
+            if len(support_corners) >= 6:
+                hull = convex_hull_xy(support_corners)
+                hull3 = np.column_stack(
+                    [hull[:, 0], hull[:, 1], np.full(len(hull), 0.01)]
+                )
+                for start, end in zip(hull3, np.roll(hull3, -1, axis=0)):
+                    add_line(
+                        self.viewer,
+                        start,
+                        end,
+                        width=0.007,
+                        rgba=np.array([0.0, 1.0, 0.35, 1.0]),
+                    )
+
         if human_motion_data is not None:
-            # Clean custom geometry
-            self.viewer.user_scn.ngeom = 0
             # Draw the task targets for reference
             for human_body_name, (pos, rot) in human_motion_data.items():
                 draw_frame(

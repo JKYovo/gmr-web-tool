@@ -180,6 +180,120 @@ quality_foot.json
 
 注意：后处理不等于真机安全验证。如果要上真机，还需要控制器侧限速、动力学约束、碰撞检查和安全保护。
 
+## 稳定性评测工具
+
+仓库提供了只读评测脚本，用来量化 ELF3 动作的重心、支撑脚范围和躯干姿态。它只生成报告，不会修改 `robot_motion.pkl`，适合用来判断“撅屁股、上身前倾、重心是否偏出支撑面”等问题。
+
+评测默认不会自动执行。需要评测时，手动运行：
+
+```bash
+PYTHONNOUSERSITE=1 conda run --no-capture-output -n gmr \
+python scripts/diagnose_robot_stability.py \
+  --robot elf3 \
+  --motion_path runtime/jobs/xxx/robot_motion.pkl
+```
+
+默认会在同目录生成：
+
+```text
+robot_motion_stability.json
+robot_motion_stability.csv
+```
+
+报告里的常用指标：
+
+- `outside_support_percent`：COM 投影落在支撑脚范围外的帧比例。
+- `min_support_margin_m`：COM 到支撑多边形边界的最小有符号距离，负数表示在外面。
+- `p95_abs_com_forward_from_support_m`：COM 相对支撑脚中心的前后偏移 95 分位。
+- `p95_abs_torso_forward_lean_deg`：躯干前后倾角 95 分位。
+- `p95_abs_waist_forward_lean_deg`：腰部前后倾角 95 分位。
+
+诊断脚本常用参数：
+
+- `--root_rot_format xyzw|wxyz`：指定 `robot_motion.pkl` 里根节点四元数格式。Web/GVHMR 标准输出通常是 `xyzw`；某些旧版 BVH 脚本输出可能是 `wxyz`。
+- `--support_height 0.08`：判断支撑脚的高度阈值，单位是米。脚底 site 距离最低脚不超过这个高度时，会被认为是支撑脚。阈值越大，越容易把抬起不高的脚也算作支撑脚。
+
+如果要从 BVH 跑一遍原始 GMR 并顺便生成评测报告，可以手动运行：
+
+```bash
+PYTHONNOUSERSITE=1 conda run --no-capture-output -n gmr \
+python scripts/retarget_bvh_stability_experiment.py \
+  --robot elf3 \
+  --bvh_file "/path/to/motion.bvh" \
+  --bvh_format 3DSM \
+  --scale 0.01 \
+  --reset_to_zero \
+  --ground_clearance 0.03 \
+  --smoothing_alpha 0.35 \
+  --save_path runtime/stability_experiments/motion.pkl
+```
+
+注意：这个脚本使用原始 GMR retarget，不包含额外重心约束、姿态约束或优化项。
+
+## 仿真显示和相机参数
+
+`scripts/xsens_bvh_to_robot.py`、`scripts/vis_robot_motion.py` 和
+`scripts/vis_robot_motion_dataset.py` 的 MuJoCo 预览默认使用
+`camera_mode=track`，并默认显示 COM 投影和支撑脚范围。这些只是可视化辅助，不会改变 retarget 结果。
+
+常用最短命令：
+
+```bash
+PYTHONNOUSERSITE=1 conda run --no-capture-output -n gmr \
+python scripts/xsens_bvh_to_robot.py \
+  --robot elf3 \
+  --bvh_file "/path/to/motion.bvh" \
+  --bvh_format 3DSM \
+  --scale 0.01 \
+  --reset_to_zero \
+  --ground_clearance 0.03 \
+  --smoothing_alpha 0.35
+```
+
+已有 pkl 可以直接用同样的默认显示效果回放：
+
+```bash
+PYTHONNOUSERSITE=1 conda run --no-capture-output -n gmr \
+python scripts/vis_robot_motion.py \
+  --robot elf3 \
+  --robot_motion_path "/path/to/robot_motion.pkl"
+```
+
+默认行为：
+
+- 相机默认是 `--camera_mode track`：视角中心跟随机器人，鼠标仍可自由旋转和缩放。
+- 默认显示 COM 地面投影，相当于开启 `--show_com_projection`。
+- 默认显示支撑脚范围，相当于开启 `--show_support_polygon`。
+- 默认不录制视频，只有仿真窗口预览。
+- 默认不生成稳定性评测报告。
+
+需要时再追加：
+
+- `--no-show_com_projection`：隐藏机器人 COM 和地面投影。
+- `--no-show_support_polygon`：隐藏估计的支撑脚范围。
+- `--camera_mode fixed`：视角中心跟随机器人，同时每帧重置距离和俯仰角，画面更稳定但视角自由度低。
+- `--camera_mode free` 或 `--free_camera`：完全自由相机，不自动跟随机器人。
+- `--record_video --video_path videos/example.mp4`：手动生成 mp4 预览视频。
+- `--save_path runtime/stability_experiments/motion.pkl`：手动保存 `robot_motion.pkl`，之后可再用 `diagnose_robot_stability.py` 做评测。
+
+可视化里的颜色含义：
+
+- 黄色地面点：COM 在地面的投影。
+- 红色小球：机器人三维 COM。
+- 黄色竖线：COM 到地面投影的连线。
+- 蓝色半透明脚框：当前估计参与支撑的脚底范围。
+- 绿色外框：双脚同时支撑时的合并支撑多边形。
+
+如果分析的是某些旧版 `xsens_bvh_to_robot.py` 直接保存的 pkl，根节点四元数可能是 `wxyz`，可以显式指定：
+
+```bash
+PYTHONNOUSERSITE=1 conda run --no-capture-output -n gmr \
+python scripts/diagnose_robot_stability.py \
+  --robot elf3 \
+  --motion_path path/to/legacy_bvh_robot_motion.pkl \
+  --root_rot_format wxyz
+```
+
 ## 仓库关系
 
 本仓库只维护 GMR 到 ELF3 的 Web 封装和后处理工具。
