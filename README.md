@@ -2,40 +2,33 @@
 
 [简体中文 README](README.zh-CN.md)
 
-This repository is a lightweight Web wrapper and tooling layer built on top of
+This repository is a lightweight Web wrapper built on top of
 [GMR: General Motion Retargeting](https://github.com/YanjieZe/GMR).
 
 It is used together with `gvhmr-web-tool`:
 
 - `gvhmr-web-tool`: converts video to human motion data such as `hmr4d_results.pt`.
-- `gmr-web-tool`: converts `hmr4d_results.pt`, BVH, or supported motion data to ELF3 robot motion.
+- `gmr-web-tool`: public Web wrapper for the original GMR to ELF3 workflow.
+- `gmr-optimizer`: optional local backend for ELF3 optimization, post-processing, diagnostics, and experiments.
 
 ## What This Repo Adds
 
 - Local Gradio/FastAPI Web UI for ELF3 retargeting.
 - Compact job history with readable file names, copyable job IDs, and download buttons.
-- Optional optimized preview generation from `robot_motion.pkl`.
-- Side-by-side original/optimized preview video comparison with playback speed and sync controls.
+- Optional external backend hook for local `gmr-optimizer`.
 - One-command local start scripts:
   - `bash start_gmr_web.sh`
   - `bash start_gmr_web_lan.sh`
   - `bash stop_gmr_web.sh`
   - `bash status_gmr_web.sh`
-- Motion post-processing tools:
-  - `tools/motion_postprocess.py`
-  - `tools/optimize_robot_motion.py`
 - ELF3 IK configuration files under `general_motion_retargeting/ik_configs/`.
 
-## Preview
+## Interface Preview
 
-The GIF below compares the original GMR preview with the optimized
-post-processed preview on the same BVH motion.
+The public Web UI keeps the default workflow focused on upload, retarget,
+preview, history, and downloads.
 
-<img src="docs/media/balei_original_vs_postprocess.gif" alt="Original GMR preview versus post-processed preview" width="960">
-
-Left: original `robot_preview.mp4`. Right: optimized `preview_foot.mp4`.
-
-[Open the full MP4 preview](docs/media/balei_original_vs_postprocess.mp4)
+<img src="docs/media/gmr_web_public_ui.png" alt="GMR Web public interface preview" width="960">
 
 ## Important: ELF3 Assets Are Not Public
 
@@ -55,8 +48,7 @@ assets/elf3/meshes/*.STL
 ```
 
 Runtime outputs, pkl files, checkpoints, SMPLX body models, SQLite databases,
-and job folders are ignored by git. Only small documentation previews under
-`docs/media/` are allowed in the repository.
+and job folders are ignored by git.
 
 ## Quick Start
 
@@ -87,165 +79,24 @@ The Web UI supports:
 - Uploading `hmr4d_results.pt`, SMPL-X `.npz`, BVH, or supported offline motion `.pkl` files.
 - Selecting ELF3 source mappings such as `gvhmr_smplx`, `bvh_xsens`, `bvh_lafan1`, and `bvh_nokov`.
 - Generating the original GMR outputs: `robot_motion.pkl`, `robot_preview.mp4`, and `artifacts.zip`.
-- Manually generating optimized preview outputs: `motion_foot.pkl`, `preview_foot.mp4`, and `quality_foot.json`.
-- Comparing original and optimized videos in the history page with synchronized play/pause, seek sync, reset, and playback speed controls.
+Optimized outputs are available only when a local external backend is configured.
 
 The task history is stored under `runtime/db/`, and per-job artifacts are stored
 under `runtime/jobs/`. These runtime folders are intentionally ignored by git.
 
-## Motion Post-Processing
+## Local Optimizer Backend
 
-Detailed Chinese guide:
-
-```text
-tools/README_motion_postprocess.md
-```
-
-Quality report only:
+The public Web path uses the original GMR workflow. To use a local optimized
+GMR backend, point the Web app at `gmr-optimizer`:
 
 ```bash
-PYTHONNOUSERSITE=1 conda run -n gvhmr python tools/motion_postprocess.py quality \
-  --input runtime/jobs/xxx/robot_motion.pkl \
-  --robot elf3
+export GMR_BACKEND=external
+export GMR_RETARGET_CMD=/home/user-kevien/gvhmr_pkg/gmr-optimizer/run_retarget.sh
+export GMR_POSTPROCESS_CMD=/home/user-kevien/gvhmr_pkg/gmr-optimizer/run_postprocess.sh
 ```
 
-Generate a smoothed preview pkl and optional mp4:
-
-```bash
-PYTHONNOUSERSITE=1 conda run -n gvhmr python tools/motion_postprocess.py optimize \
-  --input runtime/jobs/xxx/robot_motion.pkl \
-  --robot elf3 \
-  --profile soft \
-  --pipeline v2_foot \
-  --render
-```
-
-Default recommended outputs:
-
-```text
-motion_foot.pkl
-preview_foot.mp4
-quality_foot.json
-```
-
-## Stability Diagnostics
-
-The repository includes read-only diagnostics for ELF3 motion stability. These
-tools measure center-of-mass projection, estimated support-foot area, and
-torso/waist lean. They do not modify `robot_motion.pkl`.
-
-Diagnostics are not generated automatically. Run this manually when needed:
-
-```bash
-PYTHONNOUSERSITE=1 conda run --no-capture-output -n gmr \
-python scripts/diagnose_robot_stability.py \
-  --robot elf3 \
-  --motion_path runtime/jobs/xxx/robot_motion.pkl
-```
-
-By default this writes:
-
-```text
-robot_motion_stability.json
-robot_motion_stability.csv
-```
-
-Useful fields:
-
-- `outside_support_percent`: percentage of frames where the COM projection is outside the estimated support polygon.
-- `min_support_margin_m`: signed minimum COM margin to the support polygon; negative means outside.
-- `p95_abs_com_forward_from_support_m`: 95th percentile forward/backward COM offset from support center.
-- `p95_abs_torso_forward_lean_deg`: 95th percentile torso forward/backward lean.
-- `p95_abs_waist_forward_lean_deg`: 95th percentile waist forward/backward lean.
-
-Common diagnostics arguments:
-
-- `--root_rot_format xyzw|wxyz`: root quaternion format in `robot_motion.pkl`. Web/GVHMR outputs normally use `xyzw`; some legacy BVH outputs may use `wxyz`.
-- `--support_height 0.08`: support-foot height threshold in meters. A foot site within this height above the lowest foot is treated as supporting. Larger values classify low lifted feet as support more often.
-
-Run plain BVH retargeting and generate a diagnostics report manually:
-
-```bash
-PYTHONNOUSERSITE=1 conda run --no-capture-output -n gmr \
-python scripts/retarget_bvh_stability_experiment.py \
-  --robot elf3 \
-  --bvh_file "/path/to/motion.bvh" \
-  --bvh_format 3DSM \
-  --scale 0.01 \
-  --reset_to_zero \
-  --ground_clearance 0.03 \
-  --smoothing_alpha 0.35 \
-  --save_path runtime/stability_experiments/motion.pkl
-```
-
-This script uses the original GMR retargeting path. It does not add COM,
-posture, or dynamics constraints.
-
-## Viewer COM And Camera Options
-
-`scripts/xsens_bvh_to_robot.py`, `scripts/vis_robot_motion.py`, and
-`scripts/vis_robot_motion_dataset.py` default to `camera_mode=track` and show
-COM projection plus estimated support-foot areas in the MuJoCo viewer. These
-overlays are visual diagnostics only and do not change the retargeted motion.
-
-Shortest common command:
-
-```bash
-PYTHONNOUSERSITE=1 conda run --no-capture-output -n gmr \
-python scripts/xsens_bvh_to_robot.py \
-  --robot elf3 \
-  --bvh_file "/path/to/motion.bvh" \
-  --bvh_format 3DSM \
-  --scale 0.01 \
-  --reset_to_zero \
-  --ground_clearance 0.03 \
-  --smoothing_alpha 0.35
-```
-
-Replay an existing pkl with the same viewer defaults:
-
-```bash
-PYTHONNOUSERSITE=1 conda run --no-capture-output -n gmr \
-python scripts/vis_robot_motion.py \
-  --robot elf3 \
-  --robot_motion_path "/path/to/robot_motion.pkl"
-```
-
-Default behavior:
-
-- Camera defaults to `--camera_mode track`: keep the camera look-at point on the robot while allowing mouse rotation and zoom.
-- COM projection is shown by default, equivalent to `--show_com_projection`.
-- Support-foot areas are shown by default, equivalent to `--show_support_polygon`.
-- Video recording is off by default.
-- Stability diagnostics are not generated by default.
-
-Add only when needed:
-
-- `--no-show_com_projection`: hide robot COM and its ground projection.
-- `--no-show_support_polygon`: hide the estimated support-foot area.
-- `--camera_mode fixed`: keep the camera on the robot and reset distance/elevation every frame. More stable view, less freedom.
-- `--camera_mode free` or `--free_camera`: fully free camera with no automatic tracking.
-- `--record_video --video_path videos/example.mp4`: manually write an mp4 preview.
-- `--save_path runtime/stability_experiments/motion.pkl`: manually save `robot_motion.pkl`, then run `diagnose_robot_stability.py` if a report is needed.
-
-Overlay colors:
-
-- Yellow ground marker: COM projection on the ground.
-- Red sphere: 3D robot COM.
-- Yellow vertical line: COM-to-ground projection line.
-- Blue translucent foot boxes: estimated support-foot areas.
-- Green outline: combined support polygon when both feet are supporting.
-
-Some legacy BVH-generated pkl files may store the root quaternion as `wxyz`.
-For those files, pass:
-
-```bash
-PYTHONNOUSERSITE=1 conda run --no-capture-output -n gmr \
-python scripts/diagnose_robot_stability.py \
-  --robot elf3 \
-  --motion_path path/to/legacy_bvh_robot_motion.pkl \
-  --root_rot_format wxyz
-```
+Without these variables, this repository does not load optimizer or
+post-processing code.
 
 ## Upstream
 
@@ -789,21 +640,11 @@ Visualize a single motions:
 python scripts/vis_robot_motion.py --robot <robot_name> --robot_motion_path <path_to_save_robot_data.pkl>
 ```
 
-The pkl viewer defaults to camera tracking, COM projection, and estimated
-support-foot areas. If you want to record video, add `--record_video` and
-`--video_path <your_video_path,mp4>`.
-
 Visualize a folder of motions:
 
 ```bash
 python scripts/vis_robot_motion_dataset.py --robot <robot_name> --robot_motion_folder <path_to_save_robot_data_folder>
 ```
-
-Useful viewer overrides:
-* `--no-show_com_projection`: hide robot COM and its ground projection
-* `--no-show_support_polygon`: hide the estimated support-foot area
-* `--camera_mode fixed`: reset distance/elevation every frame
-* `--camera_mode free` or `--free_camera`: fully free camera
 
 After launching the MuJoCo visualization window and clicking on it, you can use the following keyboard controls::
 * `[`: play the previous motion

@@ -2,6 +2,16 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+for ENV_FILE in "${ROOT_DIR}/../.env" "${ROOT_DIR}/.env"; do
+  if [[ -f "${ENV_FILE}" ]]; then
+    set -a
+    # shellcheck disable=SC1090
+    source "${ENV_FILE}"
+    set +a
+  fi
+done
+
 HOST="${GMR_WEB_HOST:-127.0.0.1}"
 PORT="${GMR_WEB_PORT:-7870}"
 ENV_NAME="${GMR_CONDA_ENV:-gvhmr}"

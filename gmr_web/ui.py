@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo
 import gradio as gr
 
 from gmr_web.common import SOURCE_REGISTRY, SUPPORTED_ROBOTS, TERMINAL_STATUSES, UPLOAD_SOURCE_TYPES
+from gmr_web.external_backend import external_backend_enabled, external_postprocess_available
 
 
 LOCAL_TZ = ZoneInfo("Asia/Shanghai")
@@ -562,10 +563,12 @@ def build_ui(manager, gvhmr_manager=None):
             """
             <section class="gmr-hero">
               <h1>GMR Web</h1>
-              <p>内部 ELF3 机器人动作转换工具：上传人体动作文件，后台生成机器人 pkl、预览视频和可选优化版。</p>
+              <p>ELF3 机器人动作转换工具：上传人体动作文件，后台生成机器人 pkl 和预览视频。</p>
             </section>
             """
         )
+        if external_backend_enabled():
+            gr.Markdown("当前使用外部 GMR backend。")
 
         if gvhmr_manager is not None:
             with gr.Tab("从 GVHMR 结果转换"):
@@ -638,9 +641,13 @@ def build_ui(manager, gvhmr_manager=None):
                 load_job = gr.Button("查看任务", variant="primary")
                 retry_job = gr.Button("重试任务")
                 cancel_job = gr.Button("取消任务")
-                postprocess_job = gr.Button("生成优化版", variant="primary")
+                postprocess_job = gr.Button(
+                    "生成优化版",
+                    variant="primary",
+                    visible=external_postprocess_available(),
+                )
 
-            with gr.Accordion("高级后处理参数", open=False):
+            with gr.Accordion("高级后处理参数", open=False, visible=external_postprocess_available()):
                 postprocess_profile = gr.Dropdown(
                     ["soft", "preview", "strict"],
                     value="soft",
@@ -716,6 +723,10 @@ def build_ui(manager, gvhmr_manager=None):
                 interactive=False,
             )
             gr.Markdown("默认参数：`ground_clearance=0.03`，`smoothing_alpha=0.35`，生成 H.264 `robot_preview.mp4`。")
+            gr.Markdown(
+                "本仓库默认走原版 GMR。需要调用本地优化版时设置 "
+                "`GMR_BACKEND=external`、`GMR_RETARGET_CMD` 和 `GMR_POSTPROCESS_CMD`。"
+            )
 
         def submit_job(file_path, src_type, robot_name, clearance, smooth_alpha, make_video):
             if not file_path:

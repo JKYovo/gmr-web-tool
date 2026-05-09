@@ -18,17 +18,16 @@ from gmr_web.common import (
     write_json,
     zip_artifacts,
 )
-from gmr_web.runner import convert_bvh, convert_fbx_offline, convert_gvhmr_pt, convert_smplx_npz
-from tools.motion_postprocess import (
+from gmr_web.external_backend import (
     default_optimize_output,
     default_optimize_quality_output,
     default_video_output,
-    load_motion,
-    optimize_motion,
-    render_robot_motion,
-    save_motion,
-    write_report,
+    external_backend_enabled,
+    external_postprocess_available,
+    run_external_postprocess,
+    run_external_retarget,
 )
+from gmr_web.runner import convert_bvh, convert_fbx_offline, convert_gvhmr_pt, convert_smplx_npz
 
 
 POSTPROCESS_PIPELINES = {"v2", "v2_foot"}
@@ -111,6 +110,8 @@ class JobManager:
             raise RuntimeError("Only succeeded GMR jobs can be post-processed.")
         if job.get("postprocess_status") in {"queued", "running"}:
             raise RuntimeError("Postprocess is already queued or running for this job.")
+        if not external_postprocess_available():
+            raise RuntimeError("Postprocess is provided by gmr-optimizer. Please set GMR_POSTPROCESS_CMD.")
         if profile not in POSTPROCESS_PROFILES:
             raise ValueError(f"Unsupported postprocess profile: {profile}")
         if pipeline not in POSTPROCESS_PIPELINES:
@@ -262,7 +263,9 @@ class JobManager:
 
     def _run_job(self, job):
         output_dir = Path(job["output_dir"])
-        if job["source_type"] == "gvhmr_smplx":
+        if external_backend_enabled():
+            artifacts = run_external_retarget(job, logger=self._log_callback(job["job_id"]))
+        elif job["source_type"] == "gvhmr_smplx":
             artifacts = convert_gvhmr_pt(
                 job["input_file"],
                 output_dir,
@@ -305,52 +308,7 @@ class JobManager:
         job["artifacts"].update(artifacts)
 
     def _run_postprocess(self, job):
-        output_dir = Path(job["output_dir"])
-        motion_path = Path(job.get("artifacts", {}).get("motion_path") or output_dir / "robot_motion.pkl")
-        profile = job.get("postprocess_profile", "soft")
-        pipeline = job.get("postprocess_pipeline", "v2_foot")
-        render = bool(job.get("postprocess_render", True))
-        output_path = default_optimize_output(motion_path, profile, pipeline)
-        quality_path = default_optimize_quality_output(motion_path, profile, pipeline)
-        video_path = default_video_output(motion_path, profile, pipeline)
-
-        if not motion_path.exists():
-            raise FileNotFoundError(f"robot_motion.pkl is required before postprocess: {motion_path}")
-        if motion_path == output_path:
-            raise ValueError("Refusing to overwrite robot_motion.pkl during postprocess.")
-
-        log = self._log_callback(job["job_id"])
-        log(f"[Postprocess] Loading {motion_path.name}.")
-        motion = load_motion(motion_path)
-        optimized, report = optimize_motion(
-            motion,
-            robot=job["robot"],
-            profile_name=profile,
-            pipeline_name=pipeline,
-        )
-        report["input"] = str(motion_path)
-        report["output"] = str(output_path)
-        save_motion(output_path, optimized)
-        write_report(quality_path, report)
-        log(f"[Postprocess] Saved {output_path.name} and {quality_path.name}.")
-
-        artifacts = {
-            "optimized_motion_path": str(output_path),
-            "quality_report_path": str(quality_path),
-        }
-        if render:
-            log("[Postprocess] Rendering optimized preview video.")
-            render_robot_motion(
-                output_path,
-                video_path,
-                robot=job["robot"],
-                logger=log,
-            )
-            artifacts["optimized_video_path"] = str(video_path)
-            log(f"[Postprocess] Saved {video_path.name}.")
-        elif video_path.exists():
-            video_path.unlink()
-        return artifacts
+        return run_external_postprocess(job, logger=self._log_callback(job["job_id"]))
 
     def _run_convert_queue_item(self, job_id):
         job = self.get_job(job_id)
