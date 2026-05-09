@@ -39,6 +39,33 @@ if __name__ == "__main__":
         help="Show estimated support foot area/polygon in the MuJoCo viewer.",
     )
     parser.add_argument(
+        "--show_self_collision",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Highlight current robot self-collision geoms and contact points.",
+    )
+    parser.add_argument(
+        "--collision_visual_mode",
+        choices=["opaque", "transparent"],
+        default="opaque",
+        help=(
+            "Self-collision display mode. opaque keeps normal depth cues and only "
+            "colors colliding parts; transparent makes the whole robot see-through."
+        ),
+    )
+    parser.add_argument(
+        "--collision_robot_alpha",
+        type=float,
+        default=0.35,
+        help="Robot geom alpha when --collision_visual_mode transparent is enabled.",
+    )
+    parser.add_argument(
+        "--show_collision_labels",
+        action="store_true",
+        default=False,
+        help="Show collision body labels. Off by default to avoid blocking the view.",
+    )
+    parser.add_argument(
         "--free_camera",
         action="store_true",
         default=False,
@@ -112,7 +139,11 @@ if __name__ == "__main__":
                     rate_limit=True,
                     camera_mode=camera_mode,
                     show_com_projection=args.show_com_projection,
-                    show_support_polygon=args.show_support_polygon)
+                    show_support_polygon=args.show_support_polygon,
+                    show_self_collision=args.show_self_collision,
+                    collision_visual_mode=args.collision_visual_mode,
+                    collision_robot_alpha=args.collision_robot_alpha,
+                    show_collision_labels=args.show_collision_labels)
             frame_idx += 1
             if frame_idx >= len(motion_root_pos):
                 frame_idx = 0

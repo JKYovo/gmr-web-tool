@@ -12,7 +12,7 @@ robot_motion.pkl
 
 ## 当前推荐用法
 
-推荐使用 `soft + v2_foot`，这是目前的综合版本：
+常规舞蹈推荐使用 `soft + v2_foot`，这是目前的综合版本：
 
 ```bash
 PYTHONNOUSERSITE=1 conda run -n gvhmr python tools/motion_postprocess.py optimize \
@@ -41,6 +41,18 @@ PYTHONNOUSERSITE=1 conda run -n gvhmr python tools/motion_postprocess.py optimiz
   --pipeline v2_foot
 ```
 
+不加 `--render` 时脚本不会导入 Web 渲染模块，只依赖 `numpy`、`mujoco` 和 GMR 的机器人模型配置。
+
+如果动作里有明显起跳、落地、单脚支撑，优先用 `soft + arm_only` 对优化版 GMR 结果做轻量后处理。它不改 root、髋腿膝踝，只处理肩、肘、腕，所以不会额外制造脚滑：
+
+```bash
+PYTHONNOUSERSITE=1 conda run -n gmr python tools/motion_postprocess.py optimize \
+  --input runtime/jobs/xxx/robot_motion_collision.pkl \
+  --robot elf3 \
+  --profile soft \
+  --pipeline arm_only
+```
+
 ## 只做质量诊断
 
 如果只想看一个动作抖不抖、脚滑不滑，不改数据，可以用 `quality`：
@@ -64,6 +76,9 @@ dof_velocity / dof_acceleration / dof_jerk
 root_velocity / root_acceleration / root_jerk
 contact.estimated_foot_sliding_speed
 contact.estimated_ground_penetration_depth
+self_collision.collision_frame_count
+self_collision.max_penetration_m
+self_collision.top_pairs / self_collision.time_segments
 spike_count_total
 ```
 
@@ -74,9 +89,36 @@ dof_acceleration / dof_jerk 越大，关节越容易突然抽动
 root_acceleration / root_jerk 越大，身体整体位置越容易抖
 estimated_foot_sliding_speed 越大，脚底贴地时越容易滑
 estimated_ground_penetration_depth 大于 0，说明可能有脚穿地
+self_collision.collision_frame_count 越大，说明动作里可疑自碰撞越多
+self_collision.max_penetration_m 越大，说明碰撞穿透越深
 ```
 
 ## 做了哪些优化
+
+### 0. 自碰撞检测
+
+质量报告会用 ELF3 MuJoCo XML 里的 collision geom 重放整段动作，统计非地面自碰撞。
+
+报告会忽略：
+
+```text
+地面接触
+相邻 link 之间的正常近距离接触
+同一侧同一运动链附近的轻微模型接触
+```
+
+重点看：
+
+```text
+self_collision.collision_frame_count
+self_collision.collision_frame_ratio
+self_collision.collision_count
+self_collision.max_penetration_m
+self_collision.top_pairs
+self_collision.time_segments
+```
+
+这些字段可以定位“哪两个部位撞了”和“严重碰撞出现在动作的哪个时间段”。
 
 ### 1. 关节限速和平滑
 
@@ -151,7 +193,7 @@ motion_foot.pkl = v2 上身/关节平滑 + foot-lock 脚滑补偿
 
 ### `v2_foot`
 
-当前推荐。
+常规动作推荐。
 
 ```bash
 --profile soft --pipeline v2_foot
@@ -174,6 +216,38 @@ preview_foot.mp4
 quality_foot.json
 ```
 
+注意：跳跃和落地动作里，`v2_foot` 可能因为全身平滑和 root XY 补偿改变脚底接触节奏，出现起跳脚滑或落地后滑。遇到这种情况用 `arm_only`。
+
+### `arm_only`
+
+跳跃、落地、脚底接触敏感动作推荐。
+
+```bash
+--profile soft --pipeline arm_only
+```
+
+它只做：
+
+```text
+肩、肘、腕额外去抖
+上肢关节限位 clip
+```
+
+它不会改：
+
+```text
+root_pos / root_rot
+髋、膝、踝等下肢关节
+脚底接触轨迹
+```
+
+默认输出：
+
+```text
+motion_arm.pkl
+quality_arm.json
+```
+
 ### `v2`
 
 只做关节平滑，不做 foot-lock。
@@ -191,6 +265,33 @@ quality_soft.json
 ```
 
 如果 foot-lock 导致整体位置轻微晃动，可以用这个版本做对比。
+
+### `collision`
+
+实验性自碰撞避让。它不会改 root，也不会改腿和脚，只会在检测到上肢自碰撞的时间段里，对肩、肘、腕做小范围候选搜索，选择能减少 collision geom 穿透、同时动作变化较小的方案。候选修正量会额外做 jerk-aware 平滑，避免段边界产生新的尖峰。
+
+```bash
+--profile soft --pipeline collision
+```
+
+适合在已有 `motion_foot.pkl` 上单独试：
+
+```bash
+PYTHONNOUSERSITE=1 conda run --no-capture-output -n gmr python tools/motion_postprocess.py optimize \
+  --input runtime/jobs/xxx/motion_foot.pkl \
+  --robot elf3 \
+  --profile soft \
+  --pipeline collision
+```
+
+默认输出：
+
+```text
+motion_collision.pkl
+quality_collision.json
+```
+
+注意：这个 pipeline 目前主要用于看“上肢离身体远一点后，自碰撞能不能下降”。它会尽量避免引入新的速度、加速度和 jerk 峰值，但仍然不是完整的真机安全滤波。
 
 ### `legacy`
 
@@ -269,7 +370,7 @@ link_body_list
 
 ### `quality_foot.json`
 
-质量报告，记录优化前后指标、脚滑指标、foot-lock 修正量等信息。
+质量报告，记录优化前后指标、脚滑指标、自碰撞指标、foot-lock 修正量等信息。
 
 其中 `foot_lock` 字段会记录：
 

@@ -472,5 +472,105 @@
                 0.0
             ]
         ]
+    },
+    "velocity_limits": {
+        "enabled": false,
+        "default": 6.0,
+        "waist": 3.5,
+        "leg": 5.0,
+        "arm": 5.5,
+        "wrist": 7.0,
+        "max_extra_iterations": 3,
+        "joint_limits": {
+            "waist_y_joint": 3.0,
+            "waist_x_joint": 3.0,
+            "waist_z_joint": 3.0,
+            "l_knee_y_joint": 4.5,
+            "r_knee_y_joint": 4.5,
+            "l_ankle_y_joint": 4.0,
+            "l_ankle_x_joint": 4.0,
+            "r_ankle_y_joint": 4.0,
+            "r_ankle_x_joint": 4.0
+        }
+    },
+    "collision_avoidance": {
+        "enabled": false,
+        "min_distance": 0.025,
+        "detection_distance": 0.08,
+        "gain": 0.85,
+        "bound_relaxation": 0.0,
+        "fail_open": true,
+        "pairs": [
+            [
+                [
+                    "l_shoulder_z_link",
+                    "l_elbow_y_link",
+                    "l_wrist_z_link"
+                ],
+                [
+                    "torso_link",
+                    "waist_z_link",
+                    "l_hip_z_link",
+                    "l_hip_x_link",
+                    "l_knee_y_link"
+                ]
+            ],
+            [
+                [
+                    "r_shoulder_z_link",
+                    "r_elbow_y_link",
+                    "r_wrist_z_link"
+                ],
+                [
+                    "torso_link",
+                    "waist_z_link",
+                    "r_hip_z_link",
+                    "r_hip_x_link",
+                    "r_knee_y_link"
+                ]
+            ],
+            [
+                [
+                    "l_elbow_y_link",
+                    "l_wrist_z_link"
+                ],
+                [
+                    "r_elbow_y_link",
+                    "r_wrist_z_link"
+                ]
+            ],
+            [
+                [
+                    "l_ankle_x_link"
+                ],
+                [
+                    "r_ankle_x_link"
+                ]
+            ]
+        ]
+    },
+    "support_foot": {
+        "enabled": false,
+        "left_robot_frame": "l_ankle_x_link",
+        "right_robot_frame": "r_ankle_x_link",
+        "height_threshold": 0.06,
+        "velocity_threshold": 0.25,
+        "support_position_multiplier": 1.5,
+        "support_orientation_multiplier": 1.25,
+        "swing_position_multiplier": 0.85,
+        "swing_orientation_multiplier": 0.85
+    },
+    "stability": {
+        "enabled": false,
+        "left_foot_body": "l_ankle_x_link",
+        "right_foot_body": "r_ankle_x_link",
+        "support_height": 0.08,
+        "foot_length": 0.20,
+        "foot_width": 0.11,
+        "margin_threshold": 0.02,
+        "critical_margin": -0.02,
+        "torso_multiplier": 1.25,
+        "waist_multiplier": 1.2,
+        "arm_multiplier": 0.85
     }
 }

@@ -12,6 +12,25 @@ from general_motion_retargeting.utils.smpl import load_gvhmr_pred_file, get_gvhm
 from rich import print
 
 
+def build_retarget_options(args, motion_fps):
+    enable_all = args.enable_robot_constraints
+    return {
+        "velocity_limits": {
+            "enabled": enable_all or args.enable_velocity_limit,
+        },
+        "collision_avoidance": {
+            "enabled": enable_all or args.enable_collision_avoidance,
+        },
+        "support_foot": {
+            "enabled": enable_all or args.enable_support_foot,
+            "motion_fps": motion_fps,
+        },
+        "stability": {
+            "enabled": enable_all or args.enable_stability_weighting,
+        },
+    }
+
+
 def estimate_ground_offset(retargeter: GMR, motion_frames):
     # 估计人体动作里最低的关键点高度。
     #
@@ -101,6 +120,75 @@ if __name__ == "__main__":
         help="Extra lift in meters applied after ground alignment to avoid initial foot penetration.",
     )
 
+    parser.add_argument(
+        "--show_self_collision",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Highlight current robot self-collision geoms and contact points.",
+    )
+
+    parser.add_argument(
+        "--collision_visual_mode",
+        choices=["opaque", "transparent"],
+        default="opaque",
+        help=(
+            "Self-collision display mode. opaque keeps normal depth cues and only "
+            "colors colliding parts; transparent makes the whole robot see-through."
+        ),
+    )
+
+    parser.add_argument(
+        "--collision_robot_alpha",
+        type=float,
+        default=0.35,
+        help="Robot geom alpha when --collision_visual_mode transparent is enabled.",
+    )
+
+    parser.add_argument(
+        "--show_collision_labels",
+        action="store_true",
+        default=False,
+        help="Show collision body labels. Off by default to avoid blocking the view.",
+    )
+
+    parser.add_argument(
+        "--enable_robot_constraints",
+        action="store_true",
+        default=False,
+        help=(
+            "Enable the experimental source-level robot feasibility constraints "
+            "(velocity, collision, support foot, and stability weighting)."
+        ),
+    )
+
+    parser.add_argument(
+        "--enable_velocity_limit",
+        action="store_true",
+        default=False,
+        help="Enable grouped joint velocity limits during IK.",
+    )
+
+    parser.add_argument(
+        "--enable_collision_avoidance",
+        action="store_true",
+        default=False,
+        help="Enable configured self-collision avoidance during IK.",
+    )
+
+    parser.add_argument(
+        "--enable_support_foot",
+        action="store_true",
+        default=False,
+        help="Enable dynamic support-foot task weighting during IK.",
+    )
+
+    parser.add_argument(
+        "--enable_stability_weighting",
+        action="store_true",
+        default=False,
+        help="Enable COM/support-margin based task weighting during IK.",
+    )
+
     args = parser.parse_args()
 
 
@@ -135,6 +223,7 @@ if __name__ == "__main__":
         actual_human_height=actual_human_height,
         src_human="smplx",
         tgt_robot=args.robot,
+        retarget_options=build_retarget_options(args, aligned_fps),
     )
     # 第四步：把动作整体对齐到地面。
     #
@@ -218,6 +307,10 @@ if __name__ == "__main__":
             human_pos_offset=np.array([0.0, 0.0, 0.0]),
             show_human_body_name=False,
             rate_limit=args.rate_limit,
+            show_self_collision=args.show_self_collision,
+            collision_visual_mode=args.collision_visual_mode,
+            collision_robot_alpha=args.collision_robot_alpha,
+            show_collision_labels=args.show_collision_labels,
         )
         if args.save_path is not None:
             qpos_list.append(qpos)

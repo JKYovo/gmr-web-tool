@@ -14,6 +14,7 @@ import json
 import os
 import pickle
 import sys
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -30,7 +31,6 @@ if str(GMR_ROOT) not in sys.path:
 import mujoco as mj  # noqa: E402
 
 from general_motion_retargeting.params import ROBOT_XML_DICT  # noqa: E402
-from gmr_web.runner import render_robot_motion  # noqa: E402
 
 
 @dataclass(frozen=True)
@@ -176,8 +176,13 @@ def build_parser() -> argparse.ArgumentParser:
     optimize.add_argument(
         "--pipeline",
         default="v2",
-        choices=["legacy", "v2", "v2_foot"],
-        help="Optimization pipeline. legacy keeps the old full smoothing behavior; v2 focuses on arm jitter cleanup; v2_foot adds light foot-lock cleanup.",
+        choices=["legacy", "v2", "v2_foot", "arm_only", "collision"],
+        help=(
+            "Optimization pipeline. legacy keeps the old full smoothing behavior; "
+            "v2 focuses on arm jitter cleanup; v2_foot adds light foot-lock cleanup; "
+            "arm_only preserves root/lower body and only smooths arm joints; "
+            "collision adds lightweight upper-body self-collision avoidance."
+        ),
     )
     optimize.add_argument(
         "--output",
@@ -520,6 +525,18 @@ def clip_dof(dof_pos: np.ndarray, joints: list[JointInfo]) -> tuple[np.ndarray, 
     return clipped, changed
 
 
+def clip_arm_dof(dof_pos: np.ndarray, joints: list[JointInfo]) -> tuple[np.ndarray, int]:
+    clipped = np.asarray(dof_pos, dtype=np.float64).copy()
+    changed = 0
+    for joint in joints:
+        if not is_arm_joint(joint.name):
+            continue
+        before = clipped[:, joint.dof_index].copy()
+        clipped[:, joint.dof_index] = np.clip(before, joint.qrange[0], joint.qrange[1])
+        changed += int(np.count_nonzero(np.abs(before - clipped[:, joint.dof_index]) > 1e-9))
+    return clipped, changed
+
+
 def optimize_motion(
     motion: dict[str, Any],
     *,
@@ -533,6 +550,10 @@ def optimize_motion(
         return optimize_motion_v2(motion, robot=robot, profile_name=profile_name)
     if pipeline_name == "v2_foot":
         return optimize_motion_v2_foot(motion, robot=robot, profile_name=profile_name)
+    if pipeline_name == "arm_only":
+        return optimize_motion_arm_only(motion, robot=robot, profile_name=profile_name)
+    if pipeline_name == "collision":
+        return optimize_motion_collision(motion, robot=robot, profile_name=profile_name)
     raise ValueError(f"Unsupported pipeline: {pipeline_name}")
 
 
@@ -745,6 +766,102 @@ def optimize_motion_v2_foot(
     return optimized, report
 
 
+def optimize_motion_arm_only(
+    motion: dict[str, Any],
+    *,
+    robot: str,
+    profile_name: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    profile = PROFILES[profile_name]
+    model = load_robot_model(robot)
+    fps, root_pos, root_rot, dof_pos = parse_motion_arrays(motion)
+    joints = get_joint_info(model, dof_pos.shape[1], profile)
+    before = quality_metrics(root_pos, root_rot, dof_pos, fps, joints, model)
+
+    arm_smoothed_dof, arm_smooth_stats = smooth_arm_joints_extra(dof_pos, joints)
+    smoothed_dof, clipped_values = clip_arm_dof(arm_smoothed_dof, joints)
+
+    optimized = dict(motion)
+    optimized["dof_pos"] = smoothed_dof.astype(np.asarray(motion["dof_pos"]).dtype, copy=False)
+
+    after = quality_metrics(root_pos, root_rot, smoothed_dof, fps, joints, model)
+    repair = {
+        **arm_smooth_stats,
+        "preserve_root": True,
+        "preserve_lower_body": True,
+        "arm_clipped_values": int(clipped_values),
+    }
+    report = build_report(
+        robot=robot,
+        profile_name=profile_name,
+        fps=fps,
+        root_pos=root_pos,
+        root_rot=root_rot,
+        dof_pos=dof_pos,
+        optimized_root_pos=root_pos,
+        optimized_root_rot=root_rot,
+        optimized_dof_pos=smoothed_dof,
+        joints=joints,
+        before=before,
+        after=after,
+        clipped_values=clipped_values,
+        ground_z_shift=0.0,
+        pipeline_name="arm_only",
+        optimizer_version="v1_arm_only_preserve_feet",
+        repair=repair,
+    )
+    return optimized, report
+
+
+def optimize_motion_collision(
+    motion: dict[str, Any],
+    *,
+    robot: str,
+    profile_name: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    profile = PROFILES[profile_name]
+    model = load_robot_model(robot)
+    fps, root_pos, root_rot, dof_pos = parse_motion_arrays(motion)
+    joints = get_joint_info(model, dof_pos.shape[1], profile)
+    before = quality_metrics(root_pos, root_rot, dof_pos, fps, joints, model)
+
+    avoided_dof, avoidance = apply_upper_body_collision_avoidance(
+        model,
+        root_pos,
+        root_rot,
+        dof_pos,
+        fps,
+        joints,
+    )
+    avoided_dof, clipped_values = clip_dof(avoided_dof, joints)
+
+    optimized = dict(motion)
+    optimized["dof_pos"] = avoided_dof.astype(np.asarray(motion["dof_pos"]).dtype, copy=False)
+
+    after = quality_metrics(root_pos, root_rot, avoided_dof, fps, joints, model)
+    report = build_report(
+        robot=robot,
+        profile_name=profile_name,
+        fps=fps,
+        root_pos=root_pos,
+        root_rot=root_rot,
+        dof_pos=dof_pos,
+        optimized_root_pos=root_pos,
+        optimized_root_rot=root_rot,
+        optimized_dof_pos=avoided_dof,
+        joints=joints,
+        before=before,
+        after=after,
+        clipped_values=clipped_values,
+        ground_z_shift=0.0,
+        pipeline_name="collision",
+        optimizer_version="v1_upper_body_collision_avoidance",
+        repair=avoidance,
+    )
+    report["self_collision_avoidance"] = avoidance
+    return optimized, report
+
+
 def quality_only(motion: dict[str, Any], *, robot: str) -> dict[str, Any]:
     profile = PROFILES["preview"]
     model = load_robot_model(robot)
@@ -852,6 +969,7 @@ def quality_metrics(
     top_acceleration_joints = top_joint_metric(per_joint, "acceleration_max")
     top_jerk_joints = top_joint_metric(per_joint, "jerk_max")
     contacts = contact_metrics(root_pos, root_rot, dof_pos, fps, model)
+    self_collision = self_collision_metrics(root_pos, root_rot, dof_pos, fps, model)
 
     return {
         "dof_velocity": summarize_array(dof_velocity),
@@ -876,6 +994,7 @@ def quality_metrics(
         "top_acceleration_joints": top_acceleration_joints,
         "top_jerk_joints": top_jerk_joints,
         "contact": contacts,
+        "self_collision": self_collision,
         "per_joint": per_joint,
     }
 
@@ -971,6 +1090,592 @@ def remove_short_segments(mask: np.ndarray, min_length: int) -> np.ndarray:
         if end - start + 1 < min_length:
             result[start : end + 1] = False
     return result
+
+
+def mujoco_obj_name(model: mj.MjModel, obj_type: mj.mjtObj, obj_id: int, fallback: str) -> str:
+    name = mj.mj_id2name(model, obj_type, int(obj_id))
+    return name if name else f"{fallback}_{int(obj_id)}"
+
+
+def body_tree_distance(model: mj.MjModel, body_a: int, body_b: int) -> int | None:
+    parents = model.body_parentid
+    ancestors: dict[int, int] = {}
+    current = int(body_a)
+    distance = 0
+    while current >= 0:
+        ancestors[current] = distance
+        if current == 0:
+            break
+        current = int(parents[current])
+        distance += 1
+
+    current = int(body_b)
+    distance = 0
+    while current >= 0:
+        if current in ancestors:
+            return ancestors[current] + distance
+        if current == 0:
+            break
+        current = int(parents[current])
+        distance += 1
+    return None
+
+
+def body_side(name: str) -> str:
+    lower = name.lower()
+    if lower.startswith("l_") or "_l_" in lower:
+        return "left"
+    if lower.startswith("r_") or "_r_" in lower:
+        return "right"
+    return "center"
+
+
+def self_collision_pair_row(
+    pair: tuple[str, str, str, str],
+    *,
+    contact_count: int,
+    frame_count: int,
+    first_frame: int,
+    max_penetration: float,
+    fps: int,
+) -> dict[str, Any]:
+    geom1, geom2, body1, body2 = pair
+    return {
+        "geom1": geom1,
+        "geom2": geom2,
+        "body1": body1,
+        "body2": body2,
+        "contact_count": int(contact_count),
+        "frame_count": int(frame_count),
+        "first_frame": int(first_frame),
+        "first_time_s": float(first_frame / fps),
+        "max_penetration_m": float(max_penetration),
+    }
+
+
+def self_collision_pair_label(pair: tuple[str, str, str, str]) -> str:
+    geom1, geom2, body1, body2 = pair
+    return f"{geom1}[{body1}] <-> {geom2}[{body2}]"
+
+
+def summarize_self_collision_segments(
+    collision_mask: np.ndarray,
+    frame_pair_counts: dict[int, Counter[tuple[str, str, str, str]]],
+    frame_max_penetration: np.ndarray,
+    fps: int,
+    *,
+    limit: int = 20,
+) -> list[dict[str, Any]]:
+    rows = []
+    for start, end in mask_to_segments(collision_mask):
+        pair_counts: Counter[tuple[str, str, str, str]] = Counter()
+        contact_count = 0
+        for frame_idx in range(start, end + 1):
+            pair_counts.update(frame_pair_counts.get(frame_idx, Counter()))
+            contact_count += int(sum(frame_pair_counts.get(frame_idx, {}).values()))
+        max_penetration = max_value(frame_max_penetration[start : end + 1])
+        rows.append(
+            {
+                "start_frame": int(start),
+                "end_frame": int(end),
+                "start_time_s": float(start / fps),
+                "end_time_s": float(end / fps),
+                "duration_s": float((end - start + 1) / fps),
+                "frame_count": int(end - start + 1),
+                "contact_count": int(contact_count),
+                "max_penetration_m": float(max_penetration),
+                "top_pairs": [
+                    {
+                        "pair": self_collision_pair_label(pair),
+                        "contact_count": int(count),
+                    }
+                    for pair, count in pair_counts.most_common(3)
+                ],
+            }
+        )
+    rows.sort(
+        key=lambda item: (
+            item["duration_s"],
+            item["max_penetration_m"],
+            item["contact_count"],
+        ),
+        reverse=True,
+    )
+    return rows[:limit]
+
+
+def self_collision_metrics(
+    root_pos: np.ndarray,
+    root_rot_xyzw: np.ndarray,
+    dof_pos: np.ndarray,
+    fps: int,
+    model: mj.MjModel,
+) -> dict[str, Any]:
+    # This is a diagnostic, not a simulator safety guarantee. It reports
+    # MuJoCo collision-geom penetrations after filtering floor and near-chain
+    # contacts that are usually model bookkeeping rather than meaningful
+    # arm/body or left/right self-collisions.
+    penetration_epsilon = 1e-4
+    data = mj.MjData(model)
+    root_rot_wxyz = root_rot_xyzw[:, [3, 0, 1, 2]]
+    collision_mask = np.zeros((len(root_pos),), dtype=bool)
+    frame_max_penetration = np.zeros((len(root_pos),), dtype=np.float64)
+    frame_pair_counts: dict[int, Counter[tuple[str, str, str, str]]] = defaultdict(Counter)
+    pair_counts: Counter[tuple[str, str, str, str]] = Counter()
+    pair_frames: dict[tuple[str, str, str, str], set[int]] = defaultdict(set)
+    pair_first_frame: dict[tuple[str, str, str, str], int] = {}
+    pair_max_penetration: dict[tuple[str, str, str, str], float] = defaultdict(float)
+    ignored_floor_contact_count = 0
+    ignored_near_or_positive_contact_count = 0
+    ignored_adjacent_contact_count = 0
+
+    for frame_idx in range(len(root_pos)):
+        data.qpos[:3] = root_pos[frame_idx]
+        data.qpos[3:7] = root_rot_wxyz[frame_idx]
+        data.qpos[7:] = dof_pos[frame_idx]
+        mj.mj_forward(model, data)
+
+        for contact_idx in range(data.ncon):
+            contact = data.contact[contact_idx]
+            if float(contact.dist) >= -penetration_epsilon:
+                ignored_near_or_positive_contact_count += 1
+                continue
+
+            geom1_id = int(contact.geom1)
+            geom2_id = int(contact.geom2)
+            geom1 = mujoco_obj_name(model, mj.mjtObj.mjOBJ_GEOM, geom1_id, "geom")
+            geom2 = mujoco_obj_name(model, mj.mjtObj.mjOBJ_GEOM, geom2_id, "geom")
+            if geom1 == "floor" or geom2 == "floor":
+                ignored_floor_contact_count += 1
+                continue
+
+            body1_id = int(model.geom_bodyid[geom1_id])
+            body2_id = int(model.geom_bodyid[geom2_id])
+            body1 = mujoco_obj_name(model, mj.mjtObj.mjOBJ_BODY, body1_id, "body")
+            body2 = mujoco_obj_name(model, mj.mjtObj.mjOBJ_BODY, body2_id, "body")
+            distance = body_tree_distance(model, body1_id, body2_id)
+            if distance is not None and distance <= 2:
+                ignored_adjacent_contact_count += 1
+                continue
+            if (
+                body_side(body1) == body_side(body2) != "center"
+                and distance is not None
+                and distance <= 4
+            ):
+                ignored_adjacent_contact_count += 1
+                continue
+
+            if (geom2, body2) < (geom1, body1):
+                geom1, geom2 = geom2, geom1
+                body1, body2 = body2, body1
+            pair = (geom1, geom2, body1, body2)
+            penetration = -float(contact.dist)
+            collision_mask[frame_idx] = True
+            frame_max_penetration[frame_idx] = max(frame_max_penetration[frame_idx], penetration)
+            frame_pair_counts[frame_idx][pair] += 1
+            pair_counts[pair] += 1
+            pair_frames[pair].add(frame_idx)
+            pair_first_frame.setdefault(pair, frame_idx)
+            pair_max_penetration[pair] = max(pair_max_penetration[pair], penetration)
+
+    collision_frame_count = int(np.count_nonzero(collision_mask))
+    collision_count = int(sum(pair_counts.values()))
+    top_pairs = [
+        self_collision_pair_row(
+            pair,
+            contact_count=count,
+            frame_count=len(pair_frames[pair]),
+            first_frame=pair_first_frame[pair],
+            max_penetration=pair_max_penetration[pair],
+            fps=fps,
+        )
+        for pair, count in pair_counts.most_common(20)
+    ]
+    return {
+        "available": True,
+        "source": "mujoco_collision_geoms",
+        "penetration_epsilon_m": float(penetration_epsilon),
+        "frame_count": int(len(root_pos)),
+        "collision_frame_count": collision_frame_count,
+        "collision_frame_ratio": (
+            float(collision_frame_count / len(root_pos)) if len(root_pos) else 0.0
+        ),
+        "collision_count": collision_count,
+        "max_penetration_m": max_value(frame_max_penetration),
+        "ignored_floor_contact_count": int(ignored_floor_contact_count),
+        "ignored_near_or_positive_contact_count": int(ignored_near_or_positive_contact_count),
+        "ignored_adjacent_contact_count": int(ignored_adjacent_contact_count),
+        "top_pairs": top_pairs,
+        "time_segments": summarize_self_collision_segments(
+            collision_mask,
+            frame_pair_counts,
+            frame_max_penetration,
+            fps,
+        ),
+    }
+
+
+def collect_filtered_self_collisions(
+    model: mj.MjModel,
+    data: mj.MjData,
+    *,
+    penetration_epsilon: float = 1e-4,
+) -> tuple[list[tuple[tuple[str, str, str, str], float]], Counter[str]]:
+    records: list[tuple[tuple[str, str, str, str], float]] = []
+    ignored: Counter[str] = Counter()
+    for contact_idx in range(data.ncon):
+        contact = data.contact[contact_idx]
+        if float(contact.dist) >= -penetration_epsilon:
+            ignored["near_or_positive"] += 1
+            continue
+
+        geom1_id = int(contact.geom1)
+        geom2_id = int(contact.geom2)
+        geom1 = mujoco_obj_name(model, mj.mjtObj.mjOBJ_GEOM, geom1_id, "geom")
+        geom2 = mujoco_obj_name(model, mj.mjtObj.mjOBJ_GEOM, geom2_id, "geom")
+        if geom1 == "floor" or geom2 == "floor":
+            ignored["floor"] += 1
+            continue
+
+        body1_id = int(model.geom_bodyid[geom1_id])
+        body2_id = int(model.geom_bodyid[geom2_id])
+        body1 = mujoco_obj_name(model, mj.mjtObj.mjOBJ_BODY, body1_id, "body")
+        body2 = mujoco_obj_name(model, mj.mjtObj.mjOBJ_BODY, body2_id, "body")
+        distance = body_tree_distance(model, body1_id, body2_id)
+        if distance is not None and distance <= 2:
+            ignored["adjacent"] += 1
+            continue
+        if (
+            body_side(body1) == body_side(body2) != "center"
+            and distance is not None
+            and distance <= 4
+        ):
+            ignored["adjacent"] += 1
+            continue
+
+        if (geom2, body2) < (geom1, body1):
+            geom1, geom2 = geom2, geom1
+            body1, body2 = body2, body1
+        records.append(((geom1, geom2, body1, body2), -float(contact.dist)))
+    return records, ignored
+
+
+def self_collision_score_window(
+    model: mj.MjModel,
+    root_pos: np.ndarray,
+    root_rot_xyzw: np.ndarray,
+    dof_pos: np.ndarray,
+    *,
+    start: int,
+    end: int,
+) -> dict[str, Any]:
+    start = max(0, int(start))
+    end = min(len(root_pos) - 1, int(end))
+    if end < start:
+        return {
+            "frame_count": 0,
+            "contact_count": 0,
+            "total_penetration_m": 0.0,
+            "max_penetration_m": 0.0,
+            "score": (0, 0, 0.0, 0.0),
+        }
+
+    data = mj.MjData(model)
+    root_rot_wxyz = root_rot_xyzw[:, [3, 0, 1, 2]]
+    collision_frames = 0
+    contact_count = 0
+    total_penetration = 0.0
+    max_penetration = 0.0
+    for frame_idx in range(start, end + 1):
+        data.qpos[:3] = root_pos[frame_idx]
+        data.qpos[3:7] = root_rot_wxyz[frame_idx]
+        data.qpos[7:] = dof_pos[frame_idx]
+        mj.mj_forward(model, data)
+        records, _ignored = collect_filtered_self_collisions(model, data)
+        if records:
+            collision_frames += 1
+        for _pair, penetration in records:
+            contact_count += 1
+            total_penetration += penetration
+            max_penetration = max(max_penetration, penetration)
+
+    return {
+        "frame_count": int(collision_frames),
+        "contact_count": int(contact_count),
+        "total_penetration_m": float(total_penetration),
+        "max_penetration_m": float(max_penetration),
+        "score": (
+            int(collision_frames),
+            int(contact_count),
+            float(total_penetration),
+            float(max_penetration),
+        ),
+    }
+
+
+def self_collision_score_is_better(
+    candidate: dict[str, Any],
+    baseline: dict[str, Any],
+) -> bool:
+    if candidate["frame_count"] < baseline["frame_count"]:
+        return True
+    if candidate["frame_count"] > baseline["frame_count"]:
+        return False
+    if candidate["contact_count"] < baseline["contact_count"]:
+        return True
+    if candidate["contact_count"] > baseline["contact_count"]:
+        return False
+    return candidate["total_penetration_m"] < baseline["total_penetration_m"] - 1e-6
+
+
+def joint_lookup(joints: list[JointInfo]) -> dict[str, JointInfo]:
+    return {joint.name: joint for joint in joints}
+
+
+def segment_arm_sides(segment: dict[str, Any]) -> set[str]:
+    text = json.dumps(segment.get("top_pairs", []), ensure_ascii=False).lower()
+    sides = set()
+    if any(token in text for token in ("l_shoulder", "l_elbow", "l_wrist")):
+        sides.add("left")
+    if any(token in text for token in ("r_shoulder", "r_elbow", "r_wrist")):
+        sides.add("right")
+    return sides or {"left", "right"}
+
+
+def collision_avoidance_candidates(
+    sides: set[str],
+    joints_by_name: dict[str, JointInfo],
+) -> list[dict[str, float]]:
+    candidates: list[dict[str, float]] = []
+    side_prefix = {"left": "l", "right": "r"}
+    single_specs = (
+        ("shoulder_x_joint", (0.08, 0.16, 0.28)),
+        ("shoulder_y_joint", (0.08, 0.16)),
+        ("shoulder_z_joint", (0.08, 0.16, 0.28)),
+        ("elbow_y_joint", (0.08, 0.16, 0.28)),
+    )
+    for side in sorted(sides):
+        prefix = side_prefix[side]
+        for suffix, magnitudes in single_specs:
+            name = f"{prefix}_{suffix}"
+            if name not in joints_by_name:
+                continue
+            for magnitude in magnitudes:
+                candidates.append({name: magnitude})
+                candidates.append({name: -magnitude})
+
+    for side in sorted(sides):
+        prefix = side_prefix[side]
+        shoulder_x = f"{prefix}_shoulder_x_joint"
+        shoulder_z = f"{prefix}_shoulder_z_joint"
+        elbow_y = f"{prefix}_elbow_y_joint"
+        if shoulder_x in joints_by_name and elbow_y in joints_by_name:
+            for sx_sign in (-1.0, 1.0):
+                for elbow_sign in (-1.0, 1.0):
+                    candidates.append(
+                        {
+                            shoulder_x: sx_sign * 0.16,
+                            elbow_y: elbow_sign * 0.10,
+                        }
+                    )
+        if shoulder_x in joints_by_name and shoulder_z in joints_by_name:
+            for sx_sign in (-1.0, 1.0):
+                for sz_sign in (-1.0, 1.0):
+                    candidates.append(
+                        {
+                            shoulder_x: sx_sign * 0.14,
+                            shoulder_z: sz_sign * 0.10,
+                        }
+                    )
+
+    if {"left", "right"}.issubset(sides):
+        mirrored_specs = (
+            ("shoulder_x_joint", 0.16),
+            ("shoulder_z_joint", 0.16),
+            ("elbow_y_joint", 0.12),
+        )
+        for suffix, magnitude in mirrored_specs:
+            left = f"l_{suffix}"
+            right = f"r_{suffix}"
+            if left not in joints_by_name or right not in joints_by_name:
+                continue
+            candidates.append({left: magnitude, right: -magnitude})
+            candidates.append({left: -magnitude, right: magnitude})
+
+    unique = []
+    seen = set()
+    for candidate in candidates:
+        key = tuple(sorted(candidate.items()))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(candidate)
+    return unique
+
+
+def apply_joint_offsets(
+    dof_pos: np.ndarray,
+    joints_by_name: dict[str, JointInfo],
+    *,
+    start: int,
+    end: int,
+    offsets: dict[str, float],
+    ramp_frames: int,
+) -> np.ndarray:
+    result = dof_pos.copy()
+    start = max(0, int(start))
+    end = min(len(result) - 1, int(end))
+    if end < start:
+        return result
+    weights = edge_taper(end - start + 1, ramp_frames)
+    for joint_name, offset in offsets.items():
+        joint = joints_by_name.get(joint_name)
+        if joint is None:
+            continue
+        values = result[start : end + 1, joint.dof_index] + float(offset) * weights
+        result[start : end + 1, joint.dof_index] = np.clip(
+            values,
+            joint.qrange[0],
+            joint.qrange[1],
+        )
+    return result
+
+
+def apply_upper_body_collision_avoidance(
+    model: mj.MjModel,
+    root_pos: np.ndarray,
+    root_rot_xyzw: np.ndarray,
+    dof_pos: np.ndarray,
+    fps: int,
+    joints: list[JointInfo],
+) -> tuple[np.ndarray, dict[str, Any]]:
+    initial_self_collision = self_collision_metrics(root_pos, root_rot_xyzw, dof_pos, fps, model)
+    corrected = dof_pos.copy()
+    joints_by_name = joint_lookup(joints)
+    padding = max(1, int(round(0.15 * fps)))
+    ramp_frames = max(2, int(round(0.08 * fps)))
+    max_segments = 16
+    applied_segments: list[dict[str, Any]] = []
+    skipped_segments = 0
+
+    for segment in initial_self_collision.get("time_segments", [])[:max_segments]:
+        original_start = int(segment["start_frame"])
+        original_end = int(segment["end_frame"])
+        start = max(0, original_start - padding)
+        end = min(len(corrected) - 1, original_end + padding)
+        sides = segment_arm_sides(segment)
+        candidates = collision_avoidance_candidates(sides, joints_by_name)
+        if not candidates:
+            skipped_segments += 1
+            continue
+
+        baseline = self_collision_score_window(
+            model,
+            root_pos,
+            root_rot_xyzw,
+            corrected,
+            start=original_start,
+            end=original_end,
+        )
+        if baseline["contact_count"] == 0:
+            skipped_segments += 1
+            continue
+
+        best_score = baseline
+        best_candidate: dict[str, float] | None = None
+        best_motion = corrected
+        for candidate in candidates:
+            trial = apply_joint_offsets(
+                corrected,
+                joints_by_name,
+                start=start,
+                end=end,
+                offsets=candidate,
+                ramp_frames=ramp_frames,
+            )
+            score = self_collision_score_window(
+                model,
+                root_pos,
+                root_rot_xyzw,
+                trial,
+                start=original_start,
+                end=original_end,
+            )
+            if self_collision_score_is_better(score, best_score):
+                best_score = score
+                best_candidate = candidate
+                best_motion = trial
+
+        if best_candidate is None:
+            skipped_segments += 1
+            continue
+
+        corrected = best_motion
+        applied_segments.append(
+            {
+                "start_frame": original_start,
+                "end_frame": original_end,
+                "start_time_s": float(original_start / fps),
+                "end_time_s": float(original_end / fps),
+                "duration_s": float((original_end - original_start + 1) / fps),
+                "padded_start_frame": int(start),
+                "padded_end_frame": int(end),
+                "sides": sorted(sides),
+                "offsets_rad": {name: float(value) for name, value in best_candidate.items()},
+                "before": {
+                    "collision_frames": int(baseline["frame_count"]),
+                    "contacts": int(baseline["contact_count"]),
+                    "total_penetration_m": float(baseline["total_penetration_m"]),
+                    "max_penetration_m": float(baseline["max_penetration_m"]),
+                },
+                "after": {
+                    "collision_frames": int(best_score["frame_count"]),
+                    "contacts": int(best_score["contact_count"]),
+                    "total_penetration_m": float(best_score["total_penetration_m"]),
+                    "max_penetration_m": float(best_score["max_penetration_m"]),
+                },
+            }
+        )
+
+    raw_corrected = corrected
+    corrected, delta_smoothing = smooth_upper_body_delta(dof_pos, raw_corrected, joints, fps)
+    delta = corrected - dof_pos
+    final_self_collision = self_collision_metrics(root_pos, root_rot_xyzw, corrected, fps, model)
+    changed_joints = {}
+    for joint in joints:
+        values = np.abs(delta[:, joint.dof_index])
+        max_delta = max_value(values)
+        if max_delta <= 1e-8:
+            continue
+        changed_joints[joint.name] = {
+            "max_abs_delta_rad": max_delta,
+            "mean_abs_delta_rad": float(np.mean(values)),
+            "changed_frames": int(np.count_nonzero(values > 1e-8)),
+        }
+
+    return corrected, {
+        "available": True,
+        "method": "segment_candidate_search_upper_body_only",
+        "max_segments": int(max_segments),
+        "padding_frames": int(padding),
+        "ramp_frames": int(ramp_frames),
+        "segments_considered": int(min(len(initial_self_collision.get("time_segments", [])), max_segments)),
+        "segments_applied": int(len(applied_segments)),
+        "segments_skipped": int(skipped_segments),
+        "applied_segments": applied_segments,
+        "delta_smoothing": delta_smoothing,
+        "changed_joints": changed_joints,
+        "initial_self_collision": {
+            "collision_frame_count": int(initial_self_collision.get("collision_frame_count", 0)),
+            "collision_count": int(initial_self_collision.get("collision_count", 0)),
+            "max_penetration_m": float(initial_self_collision.get("max_penetration_m", 0.0)),
+        },
+        "final_self_collision": {
+            "collision_frame_count": int(final_self_collision.get("collision_frame_count", 0)),
+            "collision_count": int(final_self_collision.get("collision_count", 0)),
+            "max_penetration_m": float(final_self_collision.get("max_penetration_m", 0.0)),
+        },
+    }
 
 
 def find_foot_body_ids(model: mj.MjModel) -> list[int]:
@@ -1144,6 +1849,55 @@ def limit_vector_step(values: np.ndarray, max_step: float) -> np.ndarray:
         if norm > max_step:
             result[idx] = result[idx - 1] + delta / max(norm, 1e-8) * max_step
     return result
+
+
+def limit_scalar_step(values: np.ndarray, max_step: float) -> np.ndarray:
+    result = np.asarray(values, dtype=np.float64).copy()
+    for idx in range(1, len(result)):
+        delta = float(np.clip(result[idx] - result[idx - 1], -max_step, max_step))
+        result[idx] = result[idx - 1] + delta
+    return result
+
+
+def smooth_upper_body_delta(
+    original_dof: np.ndarray,
+    corrected_dof: np.ndarray,
+    joints: list[JointInfo],
+    fps: int,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    result = original_dof.copy()
+    delta = corrected_dof - original_dof
+    # The collision search works segment-by-segment, so the raw correction can
+    # introduce sharp changes near segment boundaries. Smooth the correction
+    # itself instead of smoothing the whole motion; this keeps the original
+    # dance timing while avoiding new jerk spikes.
+    window = max(3, int(round(0.28 * fps)))
+    refinement_window = max(3, window // 2)
+    max_step = 0.004
+    changed = {}
+    for joint in joints:
+        if not is_arm_joint(joint.name):
+            result[:, joint.dof_index] = corrected_dof[:, joint.dof_index]
+            continue
+        before = delta[:, joint.dof_index]
+        if max_value(np.abs(before)) <= 1e-8:
+            continue
+        smoothed = centered_smooth(before, window)
+        smoothed = centered_smooth(smoothed, window)
+        smoothed = limit_scalar_step(smoothed, max_step)
+        smoothed = centered_smooth(smoothed, refinement_window)
+        result[:, joint.dof_index] = original_dof[:, joint.dof_index] + smoothed
+        changed[joint.name] = {
+            "raw_max_abs_delta_rad": max_value(np.abs(before)),
+            "smoothed_max_abs_delta_rad": max_value(np.abs(smoothed)),
+            "smoothed_mean_abs_delta_rad": float(np.mean(np.abs(smoothed))),
+        }
+    return result, {
+        "window": int(odd_window(window, len(original_dof))),
+        "refinement_window": int(odd_window(refinement_window, len(original_dof))),
+        "max_step_rad_per_frame": float(max_step),
+        "changed_joints": changed,
+    }
 
 
 def apply_light_foot_lock(
@@ -1334,6 +2088,10 @@ def output_name_label(profile: str, pipeline: str) -> str:
     # 当前推荐组合 soft + v2_foot 直接叫 foot，避免 robot_motion_soft_foot_smooth 这种长串。
     if pipeline == "v2_foot":
         return "foot" if profile == "soft" else f"{profile}_foot"
+    if pipeline == "arm_only":
+        return "arm" if profile == "soft" else f"{profile}_arm"
+    if pipeline == "collision":
+        return "collision" if profile == "soft" else f"{profile}_collision"
     if pipeline == "legacy":
         return f"{profile}_legacy"
     return profile
@@ -1351,6 +2109,29 @@ def default_video_output(input_path: Path, profile: str, pipeline: str) -> Path:
     return input_path.with_name(f"preview_{output_name_label(profile, pipeline)}.mp4")
 
 
+def print_self_collision_summary(metrics: dict[str, Any], *, label: str = "self_collision") -> None:
+    self_collision = metrics.get("self_collision", {})
+    if not self_collision.get("available"):
+        return
+    frame_count = int(self_collision.get("frame_count", 0))
+    collision_frames = int(self_collision.get("collision_frame_count", 0))
+    ratio = 100.0 * float(self_collision.get("collision_frame_ratio", 0.0))
+    collision_count = int(self_collision.get("collision_count", 0))
+    max_penetration = float(self_collision.get("max_penetration_m", 0.0))
+    print(
+        f"[SelfCollision] {label}: {collision_frames}/{frame_count} frames "
+        f"({ratio:.2f}%), contacts={collision_count}, max_penetration={max_penetration:.4f} m"
+    )
+    for pair in self_collision.get("top_pairs", [])[:3]:
+        print(
+            "[SelfCollision] top_pair: "
+            f"{pair['contact_count']}x {pair['geom1']}[{pair['body1']}] "
+            f"<-> {pair['geom2']}[{pair['body2']}], "
+            f"first={pair['first_time_s']:.2f}s, "
+            f"max_penetration={pair['max_penetration_m']:.4f} m"
+        )
+
+
 def run_quality(args: argparse.Namespace) -> None:
     input_path = Path(args.input).expanduser().resolve()
     output_path = (
@@ -1366,6 +2147,7 @@ def run_quality(args: argparse.Namespace) -> None:
     print(f"[Quality] dof_acceleration_max: {metrics['dof_acceleration']['max']:.3f} rad/s^2")
     print(f"[Quality] dof_jerk_max: {metrics['dof_jerk']['max']:.3f} rad/s^3")
     print(f"[Quality] spike_count_total: {metrics['spike_count_total']}")
+    print_self_collision_summary(metrics)
 
 
 def run_optimize(args: argparse.Namespace) -> None:
@@ -1419,8 +2201,12 @@ def run_optimize(args: argparse.Namespace) -> None:
         "[Quality] spike_count_total: "
         f"{report['before']['spike_count_total']} -> {report['after']['spike_count_total']}"
     )
+    print_self_collision_summary(report["before"], label="before")
+    print_self_collision_summary(report["after"], label="after")
 
     if args.render:
+        from gmr_web.runner import render_robot_motion
+
         render_robot_motion(
             output_path,
             video_path,

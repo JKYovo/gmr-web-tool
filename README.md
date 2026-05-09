@@ -175,11 +175,62 @@ python scripts/retarget_bvh_stability_experiment.py \
   --reset_to_zero \
   --ground_clearance 0.03 \
   --smoothing_alpha 0.35 \
-  --save_path runtime/stability_experiments/motion.pkl
+  --save_path runtime/experiments/stability/motion.pkl
 ```
 
 This script uses the original GMR retargeting path. It does not add COM,
 posture, or dynamics constraints.
+
+## Source-Level GMR Constraint Experiments
+
+ELF3 IK configs now include experimental source-level constraint settings:
+
+```text
+general_motion_retargeting/ik_configs/bvh_xsens_to_elf3.json
+general_motion_retargeting/ik_configs/smplx_to_elf3.json
+```
+
+They are disabled by default, so existing Web and conversion flows keep the
+original behavior. Enable them manually for experiments:
+
+```bash
+PYTHONNOUSERSITE=1 conda run --no-capture-output -n gmr \
+python scripts/xsens_bvh_to_robot.py \
+  --robot elf3 \
+  --bvh_file "/path/to/motion.bvh" \
+  --bvh_format 3DSM \
+  --scale 0.01 \
+  --reset_to_zero \
+  --ground_clearance 0.03 \
+  --smoothing_alpha 0.35 \
+  --enable_robot_constraints
+```
+
+Individual switches:
+
+- `--enable_velocity_limit`: grouped joint velocity limits during IK.
+- `--enable_collision_avoidance`: configured self-collision avoidance during IK.
+- `--enable_support_foot`: dynamic support-foot task weighting.
+- `--enable_stability_weighting`: COM/support-margin based task weighting.
+
+Run a no-viewer baseline-vs-constraints experiment:
+
+```bash
+PYTHONNOUSERSITE=1 conda run --no-capture-output -n gmr \
+python scripts/retarget_bvh_constraints_experiment.py \
+  --robot elf3 \
+  --bvh_file "/path/to/motion.bvh" \
+  --reset_to_zero
+```
+
+The script writes `motions/robot_motion_*.pkl`, `quality/quality_*.json`,
+`stability/stability_*.json/csv`, and `summary.csv` under
+`runtime/experiments/constraints/gmr_constraints_<timestamp>/`.
+For ablations, add:
+
+```bash
+--modes baseline velocity collision support stability constraints
+```
 
 ## Viewer COM And Camera Options
 
@@ -225,8 +276,12 @@ Add only when needed:
 - `--no-show_support_polygon`: hide the estimated support-foot area.
 - `--camera_mode fixed`: keep the camera on the robot and reset distance/elevation every frame. More stable view, less freedom.
 - `--camera_mode free` or `--free_camera`: fully free camera with no automatic tracking.
+- `--show_self_collision`: highlight current self-collisions. By default the robot stays opaque, colliding geoms turn red/orange, and contact points are marked.
+- `--collision_visual_mode transparent`: switch to see-through mode for inspecting internal collisions. Depth ordering is harder to read in this mode.
+- `--collision_robot_alpha 0.35`: robot transparency used by transparent collision mode.
+- `--show_collision_labels`: show colliding body labels. Off by default to avoid blocking the view.
 - `--record_video --video_path videos/example.mp4`: manually write an mp4 preview.
-- `--save_path runtime/stability_experiments/motion.pkl`: manually save `robot_motion.pkl`, then run `diagnose_robot_stability.py` if a report is needed.
+- `--save_path runtime/experiments/stability/motion.pkl`: manually save `robot_motion.pkl`, then run `diagnose_robot_stability.py` if a report is needed.
 
 Overlay colors:
 
@@ -235,6 +290,8 @@ Overlay colors:
 - Yellow vertical line: COM-to-ground projection line.
 - Blue translucent foot boxes: estimated support-foot areas.
 - Green outline: combined support polygon when both feet are supporting.
+- Red/orange robot parts: currently colliding collision geoms.
+- Red markers and lines: current self-collision contact points and the line between colliding geom centers.
 
 Some legacy BVH-generated pkl files may store the root quaternion as `wxyz`.
 For those files, pass:

@@ -170,6 +170,7 @@ class RobotMotionViewer:
         self.xml_path = ROBOT_XML_DICT[robot_type]
         self.model = mj.MjModel.from_xml_path(str(self.xml_path))
         self.data = mj.MjData(self.model)
+        self.base_geom_rgba = self.model.geom_rgba.copy()
         self.robot_base = ROBOT_BASE_DICT[robot_type]
         self.viewer_cam_distance = VIEWER_CAM_DISTANCE_DICT[robot_type]
         mj.mj_step(self.model, self.data)
@@ -189,6 +190,7 @@ class RobotMotionViewer:
             )      
 
         self.viewer.opt.flags[mj.mjtVisFlag.mjVIS_TRANSPARENT] = transparent_robot
+        self.base_transparent_flag = transparent_robot
         
         if self.record_video:
             assert video_path is not None, "Please provide video path for recording"
@@ -225,6 +227,11 @@ class RobotMotionViewer:
             camera_mode="fixed",
             show_com_projection=False,
             show_support_polygon=False,
+            show_self_collision=False,
+            collision_visual_mode="opaque",
+            collision_penetration_epsilon=1e-4,
+            collision_robot_alpha=0.35,
+            show_collision_labels=False,
             ):
         """
         by default visualize robot motion.
@@ -241,6 +248,24 @@ class RobotMotionViewer:
         self.data.qpos[7:] = dof_pos
         
         mj.mj_forward(self.model, self.data)
+        collision_contacts = []
+        if show_self_collision:
+            self.viewer.opt.flags[mj.mjtVisFlag.mjVIS_TRANSPARENT] = (
+                1 if collision_visual_mode == "transparent" else self.base_transparent_flag
+            )
+            collision_contacts = self._collect_self_collision_contacts(
+                penetration_epsilon=collision_penetration_epsilon
+            )
+            self._apply_collision_geom_colors(
+                collision_contacts,
+                visual_mode=collision_visual_mode,
+                robot_alpha=collision_robot_alpha,
+            )
+        else:
+            self.viewer.opt.flags[
+                mj.mjtVisFlag.mjVIS_TRANSPARENT
+            ] = self.base_transparent_flag
+            self._restore_geom_colors()
 
         if follow_camera is not None:
             camera_mode = "fixed" if follow_camera else "free"
@@ -332,6 +357,12 @@ class RobotMotionViewer:
                         rgba=np.array([0.0, 1.0, 0.35, 1.0]),
                     )
 
+        if show_self_collision:
+            self._draw_collision_contacts(
+                collision_contacts,
+                show_labels=show_collision_labels,
+            )
+
         if human_motion_data is not None:
             # Draw the task targets for reference
             for human_body_name, (pos, rot) in human_motion_data.items():
@@ -353,8 +384,100 @@ class RobotMotionViewer:
             self.renderer.update_scene(self.data, camera=self.viewer.cam)
             img = self.renderer.render()
             self.mp4_writer.append_data(img)
+
+    def _restore_geom_colors(self):
+        self.model.geom_rgba[:] = self.base_geom_rgba
+
+    def _apply_collision_geom_colors(self, collision_contacts, visual_mode, robot_alpha):
+        rgba = self.base_geom_rgba.copy()
+        if visual_mode == "transparent" and robot_alpha is not None:
+            alpha = float(np.clip(robot_alpha, 0.05, 1.0))
+            for geom_id in range(self.model.ngeom):
+                geom_name = mj.mj_id2name(self.model, mj.mjtObj.mjOBJ_GEOM, geom_id)
+                if geom_name != "floor":
+                    rgba[geom_id, 3] = min(rgba[geom_id, 3], alpha)
+
+        for contact in collision_contacts:
+            rgba[contact["geom1"], :] = np.array([1.0, 0.03, 0.0, 1.0])
+            rgba[contact["geom2"], :] = np.array([1.0, 0.45, 0.0, 1.0])
+
+        self.model.geom_rgba[:] = rgba
+
+    def _collect_self_collision_contacts(self, penetration_epsilon=1e-4):
+        contacts = []
+        for contact_id in range(self.data.ncon):
+            contact = self.data.contact[contact_id]
+            if contact.dist >= -penetration_epsilon:
+                continue
+
+            geom1 = int(contact.geom1)
+            geom2 = int(contact.geom2)
+            geom1_name = mj.mj_id2name(self.model, mj.mjtObj.mjOBJ_GEOM, geom1) or ""
+            geom2_name = mj.mj_id2name(self.model, mj.mjtObj.mjOBJ_GEOM, geom2) or ""
+            if not self._is_robot_collision_geom(geom1_name):
+                continue
+            if not self._is_robot_collision_geom(geom2_name):
+                continue
+
+            body1 = int(self.model.geom_bodyid[geom1])
+            body2 = int(self.model.geom_bodyid[geom2])
+            if body1 == body2:
+                continue
+
+            contacts.append(
+                {
+                    "geom1": geom1,
+                    "geom2": geom2,
+                    "geom1_name": geom1_name,
+                    "geom2_name": geom2_name,
+                    "body1_name": mj.mj_id2name(
+                        self.model, mj.mjtObj.mjOBJ_BODY, body1
+                    )
+                    or "",
+                    "body2_name": mj.mj_id2name(
+                        self.model, mj.mjtObj.mjOBJ_BODY, body2
+                    )
+                    or "",
+                    "pos": contact.pos.copy(),
+                    "dist": float(contact.dist),
+                }
+            )
+        return contacts
+
+    @staticmethod
+    def _is_robot_collision_geom(geom_name):
+        return bool(geom_name) and geom_name != "floor" and "collision" in geom_name
+
+    def _draw_collision_contacts(self, collision_contacts, show_labels=False):
+        for contact in collision_contacts:
+            penetration = max(0.0, -contact["dist"])
+            radius = float(np.clip(0.025 + 0.8 * penetration, 0.025, 0.08))
+            label = None
+            if show_labels:
+                label = (
+                    f"{contact['body1_name']} <-> {contact['body2_name']} "
+                    f"{100.0 * penetration:.1f}cm"
+                )
+            add_marker(
+                self.viewer,
+                contact["pos"],
+                size=np.array([radius, radius, radius]),
+                rgba=np.array([0.72, 0.0, 1.0, 0.92]),
+                label=label,
+            )
+
+            geom1_pos = self.data.geom_xpos[contact["geom1"]]
+            geom2_pos = self.data.geom_xpos[contact["geom2"]]
+            add_line(
+                self.viewer,
+                geom1_pos,
+                geom2_pos,
+                width=0.01,
+                rgba=np.array([0.72, 0.0, 1.0, 0.7]),
+            )
     
     def close(self):
+        self._restore_geom_colors()
         self.viewer.close()
         time.sleep(0.5)
         if self.record_video:

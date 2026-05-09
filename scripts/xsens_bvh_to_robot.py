@@ -67,6 +67,25 @@ def smooth_qpos(qpos, prev_qpos, qpos_indices, alpha):
     return smoothed
 
 
+def build_retarget_options(args, motion_fps):
+    enable_all = args.enable_robot_constraints
+    return {
+        "velocity_limits": {
+            "enabled": enable_all or args.enable_velocity_limit,
+        },
+        "collision_avoidance": {
+            "enabled": enable_all or args.enable_collision_avoidance,
+        },
+        "support_foot": {
+            "enabled": enable_all or args.enable_support_foot,
+            "motion_fps": motion_fps,
+        },
+        "stability": {
+            "enabled": enable_all or args.enable_stability_weighting,
+        },
+    }
+
+
 if __name__ == "__main__":
 
     HERE = pathlib.Path(__file__).parent
@@ -96,6 +115,13 @@ if __name__ == "__main__":
         "--record_video",
         action="store_true",
         default=False,
+    )
+
+    parser.add_argument(
+        "--no_viewer",
+        action="store_true",
+        default=False,
+        help="Run retargeting headlessly. Save pkl without opening the MuJoCo viewer.",
     )
 
     parser.add_argument(
@@ -188,6 +214,33 @@ if __name__ == "__main__":
         default=True,
         help="Show estimated support foot area/polygon in the MuJoCo viewer.",
     )
+    parser.add_argument(
+        "--show_self_collision",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Highlight current robot self-collision geoms and contact points.",
+    )
+    parser.add_argument(
+        "--collision_visual_mode",
+        choices=["opaque", "transparent"],
+        default="opaque",
+        help=(
+            "Self-collision display mode. opaque keeps normal depth cues and only "
+            "colors colliding parts; transparent makes the whole robot see-through."
+        ),
+    )
+    parser.add_argument(
+        "--collision_robot_alpha",
+        type=float,
+        default=0.35,
+        help="Robot geom alpha when --collision_visual_mode transparent is enabled.",
+    )
+    parser.add_argument(
+        "--show_collision_labels",
+        action="store_true",
+        default=False,
+        help="Show collision body labels. Off by default to avoid blocking the view.",
+    )
 
     parser.add_argument(
         "--free_camera",
@@ -207,6 +260,44 @@ if __name__ == "__main__":
         ),
     )
 
+    parser.add_argument(
+        "--enable_robot_constraints",
+        action="store_true",
+        default=False,
+        help=(
+            "Enable the experimental source-level robot feasibility constraints "
+            "(velocity, collision, support foot, and stability weighting)."
+        ),
+    )
+
+    parser.add_argument(
+        "--enable_velocity_limit",
+        action="store_true",
+        default=False,
+        help="Enable grouped joint velocity limits during IK.",
+    )
+
+    parser.add_argument(
+        "--enable_collision_avoidance",
+        action="store_true",
+        default=False,
+        help="Enable configured self-collision avoidance during IK.",
+    )
+
+    parser.add_argument(
+        "--enable_support_foot",
+        action="store_true",
+        default=False,
+        help="Enable dynamic support-foot task weighting during IK.",
+    )
+
+    parser.add_argument(
+        "--enable_stability_weighting",
+        action="store_true",
+        default=False,
+        help="Enable COM/support-margin based task weighting during IK.",
+    )
+
     args = parser.parse_args()
 
     if args.save_path is not None:
@@ -220,10 +311,12 @@ if __name__ == "__main__":
     lafan1_data_frames, actual_human_height, frame_time = load_xsens_file(args)
 
     # Initialize the retargeting system
+    motion_fps = max(1, round(1 / frame_time))
     retargeter = GMR(
         src_human="bvh_xsens",
         tgt_robot=args.robot,
         actual_human_height=actual_human_height,
+        retarget_options=build_retarget_options(args, motion_fps),
     )
     ground_offset = estimate_ground_offset(retargeter, lafan1_data_frames) - args.ground_clearance
     retargeter.set_ground_offset(ground_offset)
@@ -231,17 +324,17 @@ if __name__ == "__main__":
     qpos_smoothing_indices = get_smoothing_qpos_indices(retargeter.model)
     prev_smoothed_qpos = None
 
-    motion_fps = max(1, round(1 / frame_time))
-
-    robot_motion_viewer = RobotMotionViewer(
-        robot_type=args.robot,
-        motion_fps=motion_fps,
-        transparent_robot=0,
-        record_video=args.record_video,
-        video_path=args.video_path,
-        # video_width=2080,
-        # video_height=1170
-    )
+    robot_motion_viewer = None
+    if not args.no_viewer:
+        robot_motion_viewer = RobotMotionViewer(
+            robot_type=args.robot,
+            motion_fps=motion_fps,
+            transparent_robot=0,
+            record_video=args.record_video,
+            video_path=args.video_path,
+            # video_width=2080,
+            # video_height=1170
+        )
 
     # FPS measurement variables
     fps_counter = 0
@@ -281,17 +374,22 @@ if __name__ == "__main__":
         prev_smoothed_qpos = qpos.copy()
 
         # visualize
-        robot_motion_viewer.step(
-            root_pos=qpos[:3],
-            root_rot=qpos[3:7],
-            dof_pos=qpos[7:],
-            human_motion_data=retargeter.scaled_human_data,
-            rate_limit=args.rate_limit,
-            camera_mode="free" if args.free_camera else args.camera_mode,
-            show_com_projection=args.show_com_projection,
-            show_support_polygon=args.show_support_polygon,
-            # human_pos_offset=np.array([0.0, 0.0, 0.0])
-        )
+        if robot_motion_viewer is not None:
+            robot_motion_viewer.step(
+                root_pos=qpos[:3],
+                root_rot=qpos[3:7],
+                dof_pos=qpos[7:],
+                human_motion_data=retargeter.scaled_human_data,
+                rate_limit=args.rate_limit,
+                camera_mode="free" if args.free_camera else args.camera_mode,
+                show_com_projection=args.show_com_projection,
+                show_support_polygon=args.show_support_polygon,
+                show_self_collision=args.show_self_collision,
+                collision_visual_mode=args.collision_visual_mode,
+                collision_robot_alpha=args.collision_robot_alpha,
+                show_collision_labels=args.show_collision_labels,
+                # human_pos_offset=np.array([0.0, 0.0, 0.0])
+            )
 
         i += 1
 
@@ -302,7 +400,10 @@ if __name__ == "__main__":
         import pickle
 
         root_pos = np.array([qpos[:3] for qpos in qpos_list])
-        root_rot = np.array([qpos[3:7] for qpos in qpos_list])
+        # MuJoCo qpos stores root quaternions as wxyz, while GMR motion pkl
+        # files use xyzw. Keep the saved format consistent with gvhmr_to_robot
+        # and data_loader.load_robot_motion().
+        root_rot = np.array([qpos[3:7][[1, 2, 3, 0]] for qpos in qpos_list])
         dof_pos = np.array([qpos[7:] for qpos in qpos_list])
         local_body_pos = None
         body_names = None
@@ -322,4 +423,5 @@ if __name__ == "__main__":
     # Close progress bar
     pbar.close()
 
-    robot_motion_viewer.close()
+    if robot_motion_viewer is not None:
+        robot_motion_viewer.close()

@@ -220,15 +220,77 @@ PYTHONNOUSERSITE=1 conda run --no-capture-output -n gmr \
 python scripts/retarget_bvh_stability_experiment.py \
   --robot elf3 \
   --bvh_file "/path/to/motion.bvh" \
-  --bvh_format 3DSM \
-  --scale 0.01 \
   --reset_to_zero \
-  --ground_clearance 0.03 \
-  --smoothing_alpha 0.35 \
-  --save_path runtime/stability_experiments/motion.pkl
+  --save_path runtime/experiments/stability/motion.pkl
 ```
 
 注意：这个脚本使用原始 GMR retarget，不包含额外重心约束、姿态约束或优化项。
+
+## GMR 源码层实验约束
+
+ELF3 的 IK 配置里已经预留了源码层约束参数，位置在：
+
+```text
+general_motion_retargeting/ik_configs/bvh_xsens_to_elf3.json
+general_motion_retargeting/ik_configs/smplx_to_elf3.json
+```
+
+这些约束默认关闭，不会影响 Web 和普通转换命令。需要做实验时手动开启：
+
+```bash
+PYTHONNOUSERSITE=1 conda run --no-capture-output -n gmr \
+python scripts/xsens_bvh_to_robot.py \
+  --robot elf3 \
+  --bvh_file "/path/to/motion.bvh" \
+  --reset_to_zero \
+  --enable_robot_constraints
+```
+
+也可以只打开其中一项：
+
+- `--enable_velocity_limit`：IK 阶段加入分组关节速度限制。
+- `--enable_collision_avoidance`：IK 阶段加入自碰撞避让。
+- `--enable_support_foot`：根据人体脚部高度和速度动态增强支撑脚任务权重。
+- `--enable_stability_weighting`：根据机器人 COM 和支撑脚 margin 轻量调整躯干、腰和上肢任务权重。
+
+GVHMR 输入同样支持这些参数：
+
+```bash
+PYTHONNOUSERSITE=1 conda run --no-capture-output -n gmr \
+python scripts/gvhmr_to_robot.py \
+  --robot elf3 \
+  --gvhmr_pred_file "/path/to/hmr4d_results.pt" \
+  --save_path runtime/jobs/xxx/manual_trials/motions/robot_motion_constraints.pkl \
+  --enable_robot_constraints
+```
+
+如果要做 baseline 和 constraints 的无窗口对比实验，用：
+
+```bash
+PYTHONNOUSERSITE=1 conda run --no-capture-output -n gmr \
+python scripts/retarget_bvh_constraints_experiment.py \
+  --robot elf3 \
+  --bvh_file "/path/to/motion.bvh" \
+  --reset_to_zero
+```
+
+默认会在 `runtime/experiments/constraints/gmr_constraints_时间戳/` 生成：
+
+```text
+motions/robot_motion_baseline.pkl
+motions/robot_motion_constraints.pkl
+quality/quality_baseline.json
+quality/quality_constraints.json
+stability/stability_baseline.json / stability/stability_baseline.csv
+stability/stability_constraints.json / stability/stability_constraints.csv
+summary.csv
+```
+
+需要逐项消融时可以加：
+
+```bash
+--modes baseline velocity collision support stability constraints
+```
 
 ## 仿真显示和相机参数
 
@@ -243,11 +305,7 @@ PYTHONNOUSERSITE=1 conda run --no-capture-output -n gmr \
 python scripts/xsens_bvh_to_robot.py \
   --robot elf3 \
   --bvh_file "/path/to/motion.bvh" \
-  --bvh_format 3DSM \
-  --scale 0.01 \
-  --reset_to_zero \
-  --ground_clearance 0.03 \
-  --smoothing_alpha 0.35
+  --reset_to_zero
 ```
 
 已有 pkl 可以直接用同样的默认显示效果回放：
@@ -273,8 +331,12 @@ python scripts/vis_robot_motion.py \
 - `--no-show_support_polygon`：隐藏估计的支撑脚范围。
 - `--camera_mode fixed`：视角中心跟随机器人，同时每帧重置距离和俯仰角，画面更稳定但视角自由度低。
 - `--camera_mode free` 或 `--free_camera`：完全自由相机，不自动跟随机器人。
+- `--show_self_collision`：显示当前帧自碰撞，默认保持机器人不透明，只把碰撞 geom 变成红/橙色，接触点显示紫色小球和连线。
+- `--collision_visual_mode transparent`：切换成透视模式，适合看身体内部，但前后遮挡关系会更难判断。
+- `--collision_robot_alpha 0.35`：透视模式下的机器人透明度，数值越小越透明。
+- `--show_collision_labels`：显示碰撞 body 名称，默认关闭，避免挡视线。
 - `--record_video --video_path videos/example.mp4`：手动生成 mp4 预览视频。
-- `--save_path runtime/stability_experiments/motion.pkl`：手动保存 `robot_motion.pkl`，之后可再用 `diagnose_robot_stability.py` 做评测。
+- `--save_path runtime/experiments/stability/motion.pkl`：手动保存 `robot_motion.pkl`，之后可再用 `diagnose_robot_stability.py` 做评测。
 
 可视化里的颜色含义：
 
@@ -283,6 +345,8 @@ python scripts/vis_robot_motion.py \
 - 黄色竖线：COM 到地面投影的连线。
 - 蓝色半透明脚框：当前估计参与支撑的脚底范围。
 - 绿色外框：双脚同时支撑时的合并支撑多边形。
+- 红/橙色机器人部位：当前正在发生自碰撞的 collision geom。
+- 紫色小球和连线：当前帧的自碰撞接触点和两个碰撞 geom 的中心连线。
 
 如果分析的是某些旧版 `xsens_bvh_to_robot.py` 直接保存的 pkl，根节点四元数可能是 `wxyz`，可以显式指定：
 
