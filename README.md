@@ -1,6 +1,6 @@
 # GMR Web Tool for ELF3
 
-[简体中文 README](README.zh-CN.md)
+[简体中文  README](README.zh-CN.md)
 
 This repository is a lightweight Web wrapper built on top of
 [GMR: General Motion Retargeting](https://github.com/YanjieZe/GMR).
